@@ -59,37 +59,6 @@ function statusTone(status?: string | null) {
   return "bg-slate-100 text-slate-700";
 }
 
-async function convertHeicIfNeeded(file: File): Promise<File> {
-  const lowerName = file.name.toLowerCase();
-
-  const isHeic =
-    file.type === "image/heic" ||
-    file.type === "image/heif" ||
-    lowerName.endsWith(".heic") ||
-    lowerName.endsWith(".heif");
-
-  if (!isHeic) {
-    return file;
-  }
-
-  const module = await import("heic2any");
-  const heic2any = module.default;
-
-  const converted = await heic2any({
-    blob: file,
-    toType: "image/jpeg",
-    quality: 0.9,
-  });
-
-  const blob = Array.isArray(converted) ? converted[0] : converted;
-  const jpgName = lowerName.replace(/\.(heic|heif)$/i, ".jpg") || "photo.jpg";
-
-  return new File([blob as BlobPart], jpgName, {
-    type: "image/jpeg",
-    lastModified: Date.now(),
-  });
-}
-
 export default function ProjectPage({
   params,
 }: {
@@ -162,23 +131,13 @@ export default function ProjectPage({
     let initialPhotoUrl: string | null = null;
 
     if (initialPhotoFile) {
-      let fileToUpload: File;
-
-      try {
-        fileToUpload = await convertHeicIfNeeded(initialPhotoFile);
-      } catch (error) {
-        console.error("Erreur conversion photo initiale :", error);
-        setErrorMsg("Erreur conversion image initiale (HEIC/HEIF).");
-        return;
-      }
-
-      const fileExt = fileToUpload.name.split(".").pop() || "jpg";
+      const fileExt = initialPhotoFile.name.split(".").pop();
       const fileName = `initial-${Date.now()}.${fileExt}`;
       const filePath = `initial/${fileName}`;
 
       const uploadResult = await supabase.storage
         .from("incident-photos")
-        .upload(filePath, fileToUpload, { upsert: true });
+        .upload(filePath, initialPhotoFile, { upsert: true });
 
       if (uploadResult.error) {
         setErrorMsg(`Upload photo initiale impossible : ${uploadResult.error.message}`);
@@ -251,23 +210,13 @@ export default function ProjectPage({
     }
 
     if (status === "closed" && closePhotoFile) {
-      let fileToUpload: File;
-
-      try {
-        fileToUpload = await convertHeicIfNeeded(closePhotoFile);
-      } catch (error) {
-        console.error("Erreur conversion photo de clôture :", error);
-        setErrorMsg("Erreur conversion image de clôture (HEIC/HEIF).");
-        return;
-      }
-
-      const fileExt = fileToUpload.name.split(".").pop() || "jpg";
+      const fileExt = closePhotoFile.name.split(".").pop();
       const fileName = `${incidentId}-close-${Date.now()}.${fileExt}`;
       const filePath = `closures/${fileName}`;
 
       const uploadResult = await supabase.storage
         .from("incident-photos")
-        .upload(filePath, fileToUpload, { upsert: true });
+        .upload(filePath, closePhotoFile, { upsert: true });
 
       if (uploadResult.error) {
         setErrorMsg(`Upload photo de clôture impossible : ${uploadResult.error.message}`);
@@ -276,18 +225,13 @@ export default function ProjectPage({
 
       const { data } = supabase.storage.from("incident-photos").getPublicUrl(filePath);
 
-      const { error: updatePhotoError } = await supabase
+      await supabase
         .from("incidents")
         .update({
           close_photo_url: data.publicUrl,
           updated_at: new Date().toISOString(),
         })
         .eq("id", incidentId);
-
-      if (updatePhotoError) {
-        setErrorMsg(updatePhotoError.message);
-        return;
-      }
     }
 
     setClosingIncidentId(null);
@@ -438,7 +382,6 @@ export default function ProjectPage({
               <input
                 type="file"
                 accept="image/*"
-                capture="environment"
                 className="rounded-2xl border border-slate-300 p-3 text-black file:mr-3 file:rounded-lg file:border-0 file:bg-slate-100 file:px-3 file:py-2"
                 onChange={(e) => setInitialPhotoFile(e.target.files?.[0] || null)}
               />
@@ -475,18 +418,10 @@ export default function ProjectPage({
                       <div className="flex-1">
                         <div className="flex flex-wrap items-center gap-2">
                           <h3 className="text-xl font-semibold text-slate-900">{incident.title}</h3>
-                          <span
-                            className={`rounded-full px-3 py-1 text-xs font-semibold ${priorityTone(
-                              incident.priority
-                            )}`}
-                          >
+                          <span className={`rounded-full px-3 py-1 text-xs font-semibold ${priorityTone(incident.priority)}`}>
                             {incident.priority || "N/A"}
                           </span>
-                          <span
-                            className={`rounded-full px-3 py-1 text-xs font-semibold ${statusTone(
-                              incident.status
-                            )}`}
-                          >
+                          <span className={`rounded-full px-3 py-1 text-xs font-semibold ${statusTone(incident.status)}`}>
                             {incident.status || "open"}
                           </span>
                         </div>
@@ -576,7 +511,6 @@ export default function ProjectPage({
                           <input
                             type="file"
                             accept="image/*"
-                            capture="environment"
                             className="rounded-2xl border border-slate-300 p-3 text-black file:mr-3 file:rounded-lg file:border-0 file:bg-slate-100 file:px-3 file:py-2"
                             onChange={(e) => setClosePhotoFile(e.target.files?.[0] || null)}
                           />
