@@ -38,6 +38,8 @@ type Incident = {
 };
 
 export default function HomePage() {
+  console.log("URL:", process.env.NEXT_PUBLIC_SUPABASE_URL);
+console.log("KEY:", process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ? "OK" : "MANQUANTE")
   const [projects, setProjects] = useState<Project[]>([]);
   const [incidents, setIncidents] = useState<Incident[]>([]);
   const [loading, setLoading] = useState(true);
