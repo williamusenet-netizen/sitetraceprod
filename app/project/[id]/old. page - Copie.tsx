@@ -2,7 +2,7 @@
 
 import React, { useEffect, useState } from "react";
 import Image from "next/image";
-import { supabase } from "@/lib/supabase";
+import { getSupabaseBrowserClient } from "@/lib/supabase";
 import {
   buildIncidentClaimMailText,
   generateIncidentClaimPdf,
@@ -65,6 +65,7 @@ export default function ProjectPage({
   params: Promise<{ id: string }>;
 }) {
   const { id } = React.use(params);
+  const supabase = getSupabaseBrowserClient();
 
   const [project, setProject] = useState<Project | null>(null);
   const [incidents, setIncidents] = useState<Incident[]>([]);

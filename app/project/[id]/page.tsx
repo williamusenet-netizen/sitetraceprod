@@ -2,11 +2,13 @@
 
 import React, { useEffect, useState } from "react";
 import Image from "next/image";
-import { supabase } from "@/lib/supabase";
+import Link from "next/link";
 import {
-  buildIncidentClaimMailText,
-  generateIncidentClaimPdf,
-} from "@/lib/pdf";
+  getSupabaseBrowserClient,
+  getUserFacingSupabaseErrorMessage,
+  normalizeSupabaseError,
+} from "@/lib/supabase";
+import { buildIncidentClaimMailText, generateIncidentClaimPdf } from "@/lib/pdf";
 
 type Project = {
   id: string;
@@ -35,6 +37,13 @@ type Incident = {
   closed_at?: string | null;
 };
 
+type ProjectPageStatus =
+  | "loading"
+  | "ready"
+  | "not-found"
+  | "config-error"
+  | "backend-unavailable";
+
 function formatDate(date?: string | null) {
   if (!date) return "N/A";
   try {
@@ -45,23 +54,22 @@ function formatDate(date?: string | null) {
 }
 
 function priorityTone(priority?: string | null) {
-  const p = (priority || "").toLowerCase();
-  if (p === "critical") return "bg-red-50 text-red-700";
-  if (p === "high") return "bg-orange-50 text-orange-700";
-  if (p === "medium") return "bg-amber-50 text-amber-700";
+  const normalizedPriority = (priority || "").toLowerCase();
+  if (normalizedPriority === "critical") return "bg-red-50 text-red-700";
+  if (normalizedPriority === "high") return "bg-orange-50 text-orange-700";
+  if (normalizedPriority === "medium") return "bg-amber-50 text-amber-700";
   return "bg-emerald-50 text-emerald-700";
 }
 
 function statusTone(status?: string | null) {
-  const s = (status || "").toLowerCase();
-  if (s === "closed") return "bg-emerald-50 text-emerald-700";
-  if (s === "in_progress") return "bg-amber-50 text-amber-700";
+  const normalizedStatus = (status || "").toLowerCase();
+  if (normalizedStatus === "closed") return "bg-emerald-50 text-emerald-700";
+  if (normalizedStatus === "in_progress") return "bg-amber-50 text-amber-700";
   return "bg-slate-100 text-slate-700";
 }
 
 async function convertHeicIfNeeded(file: File): Promise<File> {
   const lowerName = file.name.toLowerCase();
-
   const isHeic =
     file.type === "image/heic" ||
     file.type === "image/heif" ||
@@ -99,6 +107,7 @@ export default function ProjectPage({
 
   const [project, setProject] = useState<Project | null>(null);
   const [incidents, setIncidents] = useState<Incident[]>([]);
+  const [pageStatus, setPageStatus] = useState<ProjectPageStatus>("loading");
   const [errorMsg, setErrorMsg] = useState("");
   const [successMsg, setSuccessMsg] = useState("");
 
@@ -116,32 +125,58 @@ export default function ProjectPage({
   const [closePhotoFile, setClosePhotoFile] = useState<File | null>(null);
 
   const load = async () => {
+    setPageStatus("loading");
     setErrorMsg("");
+    console.info("[FieldTrace][Project] Loading page data", { projectId: id });
 
-    const { data: projectData, error: projectError } = await supabase
-      .from("projects")
-      .select("*")
-      .eq("id", id)
-      .single();
+    try {
+      const supabase = getSupabaseBrowserClient();
+      const { data: projectData, error: projectError } = await supabase
+        .from("projects")
+        .select("*")
+        .eq("id", id)
+        .maybeSingle();
 
-    if (projectError) {
-      setErrorMsg(projectError.message);
-      return;
+      if (projectError) {
+        throw projectError;
+      }
+
+      if (!projectData) {
+        console.warn("[FieldTrace][Project] Project not found", { projectId: id });
+        setProject(null);
+        setIncidents([]);
+        setPageStatus("not-found");
+        return;
+      }
+
+      const { data: incidentData, error: incidentError } = await supabase
+        .from("incidents")
+        .select("*")
+        .eq("project_id", id)
+        .order("created_at", { ascending: false });
+
+      if (incidentError) {
+        throw incidentError;
+      }
+
+      setProject(projectData);
+      setIncidents((incidentData || []) as Incident[]);
+      setPageStatus("ready");
+      console.info("[FieldTrace][Project] Page data loaded", {
+        projectId: id,
+        incidentCount: (incidentData || []).length,
+      });
+    } catch (error) {
+      const normalizedError = normalizeSupabaseError(error);
+      console.error("[FieldTrace][Project] Page load failed", {
+        projectId: id,
+        error: normalizedError,
+      });
+      setProject(null);
+      setIncidents([]);
+      setPageStatus(normalizedError.kind === "config" ? "config-error" : "backend-unavailable");
+      setErrorMsg(getUserFacingSupabaseErrorMessage(normalizedError.kind));
     }
-
-    const { data: incidentData, error: incidentError } = await supabase
-      .from("incidents")
-      .select("*")
-      .eq("project_id", id)
-      .order("created_at", { ascending: false });
-
-    if (incidentError) {
-      setErrorMsg(incidentError.message);
-      return;
-    }
-
-    setProject(projectData);
-    setIncidents((incidentData || []) as Incident[]);
   };
 
   useEffect(() => {
@@ -155,151 +190,179 @@ export default function ProjectPage({
     setSuccessMsg("");
 
     if (!title.trim()) {
-      setErrorMsg("Le titre de l’incident est obligatoire.");
+      setErrorMsg("Le titre de l'incident est obligatoire.");
       return;
     }
 
-    let initialPhotoUrl: string | null = null;
+    console.info("[FieldTrace][Project] Creating incident", { projectId: id, title: title.trim() });
 
-    if (initialPhotoFile) {
-      let fileToUpload: File;
+    try {
+      const supabase = getSupabaseBrowserClient();
+      let initialPhotoUrl: string | null = null;
 
-      try {
-        fileToUpload = await convertHeicIfNeeded(initialPhotoFile);
-      } catch (error) {
-        console.error("Erreur conversion photo initiale :", error);
-        setErrorMsg("Erreur conversion image initiale (HEIC/HEIF).");
+      if (initialPhotoFile) {
+        let fileToUpload: File;
+
+        try {
+          fileToUpload = await convertHeicIfNeeded(initialPhotoFile);
+        } catch (error) {
+          console.error("[FieldTrace][Project] Initial photo conversion failed", error);
+          setErrorMsg("Erreur conversion image initiale (HEIC/HEIF).");
+          return;
+        }
+
+        const fileExt = fileToUpload.name.split(".").pop() || "jpg";
+        const fileName = `initial-${Date.now()}.${fileExt}`;
+        const filePath = `initial/${fileName}`;
+
+        const uploadResult = await supabase.storage
+          .from("incident-photos")
+          .upload(filePath, fileToUpload, { upsert: true });
+
+        if (uploadResult.error) {
+          setErrorMsg(`Upload photo initiale impossible : ${uploadResult.error.message}`);
+          console.warn("[FieldTrace][Project] Initial photo upload failed", uploadResult.error);
+          return;
+        }
+
+        const { data } = supabase.storage.from("incident-photos").getPublicUrl(filePath);
+        initialPhotoUrl = data.publicUrl;
+      }
+
+      const { error } = await supabase.from("incidents").insert({
+        project_id: id,
+        title: title.trim(),
+        description: description.trim() || null,
+        category,
+        priority,
+        status: "open",
+        location: location.trim() || null,
+        reporter_name: reporterName.trim() || null,
+        initial_photo_url: initialPhotoUrl,
+        updated_at: new Date().toISOString(),
+      });
+
+      if (error) {
+        setErrorMsg(error.message);
+        console.warn("[FieldTrace][Project] Incident creation rejected", error);
         return;
       }
 
-      const fileExt = fileToUpload.name.split(".").pop() || "jpg";
-      const fileName = `initial-${Date.now()}.${fileExt}`;
-      const filePath = `initial/${fileName}`;
-
-      const uploadResult = await supabase.storage
-        .from("incident-photos")
-        .upload(filePath, fileToUpload, { upsert: true });
-
-      if (uploadResult.error) {
-        setErrorMsg(`Upload photo initiale impossible : ${uploadResult.error.message}`);
-        return;
-      }
-
-      const { data } = supabase.storage.from("incident-photos").getPublicUrl(filePath);
-      initialPhotoUrl = data.publicUrl;
+      setTitle("");
+      setDescription("");
+      setCategory("interface");
+      setPriority("medium");
+      setLocation("");
+      setReporterName("");
+      setInitialPhotoFile(null);
+      setSuccessMsg("Incident créé.");
+      console.info("[FieldTrace][Project] Incident created successfully", { projectId: id });
+      await load();
+    } catch (error) {
+      const normalizedError = normalizeSupabaseError(error);
+      console.error("[FieldTrace][Project] Incident creation failed", normalizedError);
+      setErrorMsg(getUserFacingSupabaseErrorMessage(normalizedError.kind));
     }
-
-    const { error } = await supabase.from("incidents").insert({
-      project_id: id,
-      title: title.trim(),
-      description: description.trim() || null,
-      category,
-      priority,
-      status: "open",
-      location: location.trim() || null,
-      reporter_name: reporterName.trim() || null,
-      initial_photo_url: initialPhotoUrl,
-      updated_at: new Date().toISOString(),
-    });
-
-    if (error) {
-      setErrorMsg(error.message);
-      return;
-    }
-
-    setTitle("");
-    setDescription("");
-    setCategory("interface");
-    setPriority("medium");
-    setLocation("");
-    setReporterName("");
-    setInitialPhotoFile(null);
-    setSuccessMsg("Incident créé.");
-    load();
   };
 
-  const updateIncidentStatus = async (incidentId: string, status: string) => {
+  const updateIncidentStatus = async (incidentId: string, nextStatus: string) => {
     setErrorMsg("");
     setSuccessMsg("");
+    console.info("[FieldTrace][Project] Updating incident status", {
+      projectId: id,
+      incidentId,
+      nextStatus,
+    });
 
-    const payload: Record<string, unknown> = {
-      status,
-      updated_at: new Date().toISOString(),
-    };
+    try {
+      const supabase = getSupabaseBrowserClient();
+      const payload: Record<string, unknown> = {
+        status: nextStatus,
+        updated_at: new Date().toISOString(),
+      };
 
-    if (status === "closed") {
-      payload.close_comment = closeComment.trim() || null;
-      payload.closed_by_name = closedByName.trim() || null;
-      payload.closed_at = new Date().toISOString();
-    }
+      if (nextStatus === "closed") {
+        payload.close_comment = closeComment.trim() || null;
+        payload.closed_by_name = closedByName.trim() || null;
+        payload.closed_at = new Date().toISOString();
+      }
 
-    if (status !== "closed") {
-      payload.close_comment = null;
-      payload.close_photo_url = null;
-      payload.closed_by_name = null;
-      payload.closed_at = null;
-    }
+      if (nextStatus !== "closed") {
+        payload.close_comment = null;
+        payload.close_photo_url = null;
+        payload.closed_by_name = null;
+        payload.closed_at = null;
+      }
 
-    const { error } = await supabase
-      .from("incidents")
-      .update(payload)
-      .eq("id", incidentId);
+      const { error } = await supabase.from("incidents").update(payload).eq("id", incidentId);
 
-    if (error) {
-      setErrorMsg(error.message);
-      return;
-    }
-
-    if (status === "closed" && closePhotoFile) {
-      let fileToUpload: File;
-
-      try {
-        fileToUpload = await convertHeicIfNeeded(closePhotoFile);
-      } catch (error) {
-        console.error("Erreur conversion photo de clôture :", error);
-        setErrorMsg("Erreur conversion image de clôture (HEIC/HEIF).");
+      if (error) {
+        setErrorMsg(error.message);
+        console.warn("[FieldTrace][Project] Incident status update rejected", error);
         return;
       }
 
-      const fileExt = fileToUpload.name.split(".").pop() || "jpg";
-      const fileName = `${incidentId}-close-${Date.now()}.${fileExt}`;
-      const filePath = `closures/${fileName}`;
+      if (nextStatus === "closed" && closePhotoFile) {
+        let fileToUpload: File;
 
-      const uploadResult = await supabase.storage
-        .from("incident-photos")
-        .upload(filePath, fileToUpload, { upsert: true });
+        try {
+          fileToUpload = await convertHeicIfNeeded(closePhotoFile);
+        } catch (error) {
+          console.error("[FieldTrace][Project] Closure photo conversion failed", error);
+          setErrorMsg("Erreur conversion image de clôture (HEIC/HEIF).");
+          return;
+        }
 
-      if (uploadResult.error) {
-        setErrorMsg(`Upload photo de clôture impossible : ${uploadResult.error.message}`);
-        return;
+        const fileExt = fileToUpload.name.split(".").pop() || "jpg";
+        const fileName = `${incidentId}-close-${Date.now()}.${fileExt}`;
+        const filePath = `closures/${fileName}`;
+
+        const uploadResult = await supabase.storage
+          .from("incident-photos")
+          .upload(filePath, fileToUpload, { upsert: true });
+
+        if (uploadResult.error) {
+          setErrorMsg(`Upload photo de clôture impossible : ${uploadResult.error.message}`);
+          console.warn("[FieldTrace][Project] Closure photo upload failed", uploadResult.error);
+          return;
+        }
+
+        const { data } = supabase.storage.from("incident-photos").getPublicUrl(filePath);
+        const { error: updatePhotoError } = await supabase
+          .from("incidents")
+          .update({
+            close_photo_url: data.publicUrl,
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", incidentId);
+
+        if (updatePhotoError) {
+          setErrorMsg(updatePhotoError.message);
+          console.warn("[FieldTrace][Project] Closure photo persistence failed", updatePhotoError);
+          return;
+        }
       }
 
-      const { data } = supabase.storage.from("incident-photos").getPublicUrl(filePath);
-
-      const { error: updatePhotoError } = await supabase
-        .from("incidents")
-        .update({
-          close_photo_url: data.publicUrl,
-          updated_at: new Date().toISOString(),
-        })
-        .eq("id", incidentId);
-
-      if (updatePhotoError) {
-        setErrorMsg(updatePhotoError.message);
-        return;
-      }
+      setClosingIncidentId(null);
+      setCloseComment("");
+      setClosedByName("");
+      setClosePhotoFile(null);
+      setSuccessMsg(`Incident passé en ${nextStatus}.`);
+      console.info("[FieldTrace][Project] Incident status updated successfully", {
+        projectId: id,
+        incidentId,
+        nextStatus,
+      });
+      await load();
+    } catch (error) {
+      const normalizedError = normalizeSupabaseError(error);
+      console.error("[FieldTrace][Project] Incident status update failed", normalizedError);
+      setErrorMsg(getUserFacingSupabaseErrorMessage(normalizedError.kind));
     }
-
-    setClosingIncidentId(null);
-    setCloseComment("");
-    setClosedByName("");
-    setClosePhotoFile(null);
-    setSuccessMsg(`Incident passé en ${status}.`);
-    load();
   };
 
-  if (!project) {
-    return <main className="p-8">Chargement...</main>;
+  if (pageStatus !== "ready" || !project) {
+    return <ProjectStatusScreen status={pageStatus} errorMsg={errorMsg} />;
   }
 
   const projectName = project.site_name || project.name || "Projet";
@@ -322,20 +385,16 @@ export default function ProjectPage({
                   />
                 </div>
                 <div>
-                  <button
-                    onClick={() => {
-                      window.location.href = "/";
-                    }}
-                    className="mb-3 rounded-xl bg-white/10 px-4 py-2 text-sm text-white backdrop-blur-sm"
+                  <Link
+                    href="/"
+                    className="mb-3 inline-flex rounded-xl bg-white/10 px-4 py-2 text-sm text-white backdrop-blur-sm"
                   >
                     ← Retour accueil
-                  </button>
+                  </Link>
                   <p className="text-xs uppercase tracking-[0.25em] text-slate-300">
                     project command center
                   </p>
-                  <h1 className="mt-1 text-3xl font-bold tracking-tight md:text-4xl">
-                    {projectName}
-                  </h1>
+                  <h1 className="mt-1 text-3xl font-bold tracking-tight md:text-4xl">{projectName}</h1>
                   <p className="mt-2 text-sm text-slate-300 md:text-base">
                     {project.client_name || "Client N/A"} — {project.location || "Localisation N/A"}
                   </p>
@@ -345,11 +404,11 @@ export default function ProjectPage({
               <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
                 <MiniMetric
                   label="Ouverts"
-                  value={incidents.filter((i) => (i.status || "open") !== "closed").length}
+                  value={incidents.filter((incident) => (incident.status || "open") !== "closed").length}
                 />
                 <MiniMetric
                   label="Clôturés"
-                  value={incidents.filter((i) => (i.status || "open") === "closed").length}
+                  value={incidents.filter((incident) => (incident.status || "open") === "closed").length}
                 />
                 <MiniMetric label="Total" value={incidents.length} />
               </div>
@@ -377,7 +436,7 @@ export default function ProjectPage({
               </p>
               <h2 className="mt-1 text-2xl font-bold text-slate-900">Nouveau signalement</h2>
               <p className="mt-1 text-slate-600">
-                Déclare un incident avec contexte, photo initiale et niveau de priorité.
+                Déclarez un incident avec contexte, photo initiale et niveau de priorité.
               </p>
             </div>
 
@@ -386,13 +445,13 @@ export default function ProjectPage({
                 className="rounded-2xl border border-slate-300 p-3 text-black"
                 placeholder="Titre incident"
                 value={title}
-                onChange={(e) => setTitle(e.target.value)}
+                onChange={(event) => setTitle(event.target.value)}
               />
               <input
                 className="rounded-2xl border border-slate-300 p-3 text-black"
                 placeholder="Zone / localisation"
                 value={location}
-                onChange={(e) => setLocation(e.target.value)}
+                onChange={(event) => setLocation(event.target.value)}
               />
             </div>
 
@@ -400,14 +459,14 @@ export default function ProjectPage({
               className="mt-4 min-h-[120px] w-full rounded-2xl border border-slate-300 p-3 text-black"
               placeholder="Commentaire initial / description factuelle"
               value={description}
-              onChange={(e) => setDescription(e.target.value)}
+              onChange={(event) => setDescription(event.target.value)}
             />
 
             <div className="mt-4 grid gap-4 md:grid-cols-2">
               <select
                 className="rounded-2xl border border-slate-300 p-3 text-black"
                 value={category}
-                onChange={(e) => setCategory(e.target.value)}
+                onChange={(event) => setCategory(event.target.value)}
               >
                 <option value="interface">Interface</option>
                 <option value="quality">Qualité</option>
@@ -419,7 +478,7 @@ export default function ProjectPage({
               <select
                 className="rounded-2xl border border-slate-300 p-3 text-black"
                 value={priority}
-                onChange={(e) => setPriority(e.target.value)}
+                onChange={(event) => setPriority(event.target.value)}
               >
                 <option value="low">Low</option>
                 <option value="medium">Medium</option>
@@ -433,14 +492,14 @@ export default function ProjectPage({
                 className="rounded-2xl border border-slate-300 p-3 text-black"
                 placeholder="Déclaré par"
                 value={reporterName}
-                onChange={(e) => setReporterName(e.target.value)}
+                onChange={(event) => setReporterName(event.target.value)}
               />
               <input
                 type="file"
                 accept="image/*"
                 capture="environment"
                 className="rounded-2xl border border-slate-300 p-3 text-black file:mr-3 file:rounded-lg file:border-0 file:bg-slate-100 file:px-3 file:py-2"
-                onChange={(e) => setInitialPhotoFile(e.target.files?.[0] || null)}
+                onChange={(event) => setInitialPhotoFile(event.target.files?.[0] || null)}
               />
             </div>
 
@@ -459,7 +518,8 @@ export default function ProjectPage({
               </p>
               <h2 className="mt-1 text-2xl font-bold text-slate-900">Incidents</h2>
               <p className="mt-1 text-slate-600">
-                Mets à jour les statuts, génère les claims unitaires et conserve la traçabilité visuelle.
+                Mettez à jour les statuts, générez les claims unitaires et conservez la
+                traçabilité visuelle.
               </p>
             </div>
 
@@ -556,13 +616,13 @@ export default function ProjectPage({
 
                     {closingIncidentId === incident.id && (
                       <div className="mt-4 rounded-2xl border border-slate-200 bg-slate-50 p-4">
-                        <h4 className="font-semibold text-slate-900">Clôturer l’incident</h4>
+                        <h4 className="font-semibold text-slate-900">Clôturer l'incident</h4>
 
                         <textarea
                           className="mt-3 min-h-[100px] w-full rounded-2xl border border-slate-300 p-3 text-black"
                           placeholder="Commentaire de clôture"
                           value={closeComment}
-                          onChange={(e) => setCloseComment(e.target.value)}
+                          onChange={(event) => setCloseComment(event.target.value)}
                         />
 
                         <div className="mt-3 grid gap-4 md:grid-cols-2">
@@ -570,7 +630,7 @@ export default function ProjectPage({
                             className="rounded-2xl border border-slate-300 p-3 text-black"
                             placeholder="Clôturé par"
                             value={closedByName}
-                            onChange={(e) => setClosedByName(e.target.value)}
+                            onChange={(event) => setClosedByName(event.target.value)}
                           />
 
                           <input
@@ -578,7 +638,7 @@ export default function ProjectPage({
                             accept="image/*"
                             capture="environment"
                             className="rounded-2xl border border-slate-300 p-3 text-black file:mr-3 file:rounded-lg file:border-0 file:bg-slate-100 file:px-3 file:py-2"
-                            onChange={(e) => setClosePhotoFile(e.target.files?.[0] || null)}
+                            onChange={(event) => setClosePhotoFile(event.target.files?.[0] || null)}
                           />
                         </div>
 
@@ -635,10 +695,86 @@ export default function ProjectPage({
           </section>
 
           <footer className="pb-2 text-center text-[10px] leading-4 text-slate-400">
-            © {new Date().getFullYear()} FieldTrace. Concept, structure fonctionnelle, interface et logique applicative réservés.
-            Toute reproduction, adaptation ou exploitation non autorisée est interdite.
+            © {new Date().getFullYear()} FieldTrace. Concept, structure fonctionnelle, interface et
+            logique applicative réservés. Toute reproduction, adaptation ou exploitation non
+            autorisée est interdite.
           </footer>
         </div>
+      </div>
+    </main>
+  );
+}
+
+function ProjectStatusScreen({
+  status,
+  errorMsg,
+}: {
+  status: ProjectPageStatus;
+  errorMsg: string;
+}) {
+  const titleByStatus: Record<ProjectPageStatus, string> = {
+    loading: "Chargement en cours du projet...",
+    "not-found": "Projet introuvable",
+    "config-error": "Erreur de configuration",
+    "backend-unavailable": "Backend indisponible",
+    ready: "Chargement en cours du projet...",
+  };
+
+  const descriptionByStatus: Record<ProjectPageStatus, string> = {
+    loading: "Les données terrain du projet sont en cours de récupération.",
+    "not-found": "Le projet demandé est introuvable. Vérifiez le lien ou retournez à l'accueil.",
+    "config-error":
+      "Vérifiez les variables d’environnement Vercel NEXT_PUBLIC_SUPABASE_URL et NEXT_PUBLIC_SUPABASE_ANON_KEY.",
+    "backend-unavailable":
+      "Impossible de joindre Supabase pour le moment. Réessayez dans quelques instants.",
+    ready: "Les données terrain du projet sont en cours de récupération.",
+  };
+
+  const toneClassName =
+    status === "loading"
+      ? "border-slate-200 bg-slate-50 text-slate-700"
+      : status === "not-found"
+        ? "border-amber-200 bg-amber-50 text-amber-900"
+        : "border-red-200 bg-red-50 text-red-700";
+
+  return (
+    <main className="min-h-screen bg-slate-100">
+      <div className="mx-auto flex min-h-screen max-w-4xl items-center px-4 py-10 md:px-8">
+        <section className="w-full overflow-hidden rounded-[28px] border border-slate-200 bg-white shadow-sm">
+          <div className="bg-gradient-to-r from-slate-950 via-slate-900 to-slate-800 px-6 py-8 text-white md:px-8">
+            <div className="flex items-center gap-4">
+              <div className="overflow-hidden rounded-2xl border border-white/10 bg-slate-900 p-2 shadow-lg">
+                <Image
+                  src="/fieldtrace-logo.svg"
+                  alt="FieldTrace logo"
+                  width={64}
+                  height={64}
+                  priority
+                  className="h-14 w-14 rounded-xl"
+                />
+              </div>
+              <div>
+                <p className="text-xs uppercase tracking-[0.25em] text-slate-300">project command center</p>
+                <h1 className="mt-1 text-3xl font-bold tracking-tight md:text-4xl">FieldTrace</h1>
+              </div>
+            </div>
+          </div>
+
+          <div className="space-y-4 p-6 md:p-8">
+            <div className={`rounded-2xl border p-6 ${toneClassName}`}>
+              <h2 className="text-2xl font-bold">{titleByStatus[status]}</h2>
+              <p className="mt-2 text-sm">{descriptionByStatus[status]}</p>
+              {errorMsg && <p className="mt-3 text-sm font-medium">{errorMsg}</p>}
+            </div>
+
+            <Link
+              href="/"
+              className="inline-flex rounded-xl bg-slate-900 px-4 py-2 text-sm text-white"
+            >
+              Retour à l'accueil
+            </Link>
+          </div>
+        </section>
       </div>
     </main>
   );

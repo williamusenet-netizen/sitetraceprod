@@ -1,8 +1,13 @@
 "use client";
 
 import Image from "next/image";
+import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
-import { supabase } from "@/lib/supabase";
+import {
+  getSupabaseBrowserClient,
+  getUserFacingSupabaseErrorMessage,
+  normalizeSupabaseError,
+} from "@/lib/supabase";
 import { generateProjectReportPdf } from "@/lib/pdf";
 
 type RawProject = {
@@ -37,12 +42,12 @@ type Incident = {
   created_at?: string | null;
 };
 
+type DashboardStatus = "loading" | "ready" | "config-error" | "backend-unavailable";
+
 export default function HomePage() {
-  console.log("URL:", process.env.NEXT_PUBLIC_SUPABASE_URL);
-console.log("KEY:", process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ? "OK" : "MANQUANTE")
   const [projects, setProjects] = useState<Project[]>([]);
   const [incidents, setIncidents] = useState<Incident[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [dashboardStatus, setDashboardStatus] = useState<DashboardStatus>("loading");
   const [errorMsg, setErrorMsg] = useState("");
   const [successMsg, setSuccessMsg] = useState("");
 
@@ -52,19 +57,34 @@ console.log("KEY:", process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ? "OK" : "MANQUANT
   const [saving, setSaving] = useState(false);
 
   const loadData = async () => {
-    setLoading(true);
+    setDashboardStatus("loading");
     setErrorMsg("");
+    console.info("[FieldTrace][Home] Loading dashboard data");
 
-    const { data: projectData, error: projectError } = await supabase
-      .from("projects")
-      .select("id, name, site_name, client_name, location, status, created_at")
-      .order("created_at", { ascending: false });
+    try {
+      const supabase = getSupabaseBrowserClient();
+      const [projectResult, incidentResult] = await Promise.all([
+        supabase
+          .from("projects")
+          .select("id, name, site_name, client_name, location, status, created_at")
+          .order("created_at", { ascending: false }),
+        supabase
+          .from("incidents")
+          .select(
+            "id, project_id, title, description, category, priority, status, reporter_name, initial_photo_url, created_at"
+          )
+          .order("created_at", { ascending: false }),
+      ]);
 
-    if (projectError) {
-      setProjects([]);
-      setErrorMsg(`Chargement projets impossible : ${projectError.message}`);
-    } else {
-      const mapped = ((projectData || []) as RawProject[]).map((project) => ({
+      if (projectResult.error) {
+        throw projectResult.error;
+      }
+
+      if (incidentResult.error) {
+        throw incidentResult.error;
+      }
+
+      const mappedProjects = ((projectResult.data || []) as RawProject[]).map((project) => ({
         id: project.id,
         display_name: project.site_name || project.name || "Projet sans nom",
         client_name: project.client_name || null,
@@ -72,26 +92,24 @@ console.log("KEY:", process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ? "OK" : "MANQUANT
         status: project.status || "active",
         created_at: project.created_at || null,
       }));
-      setProjects(mapped);
-    }
 
-    const { data: incidentData, error: incidentError } = await supabase
-      .from("incidents")
-      .select(
-        "id, project_id, title, description, category, priority, status, reporter_name, initial_photo_url, created_at"
-      )
-      .order("created_at", { ascending: false });
-
-    if (incidentError) {
+      setProjects(mappedProjects);
+      setIncidents((incidentResult.data || []) as Incident[]);
+      setDashboardStatus("ready");
+      console.info("[FieldTrace][Home] Dashboard data loaded", {
+        projectCount: mappedProjects.length,
+        incidentCount: (incidentResult.data || []).length,
+      });
+    } catch (error) {
+      const normalizedError = normalizeSupabaseError(error);
+      console.error("[FieldTrace][Home] Dashboard load failed", normalizedError);
+      setProjects([]);
       setIncidents([]);
-      if (!projectError) {
-        setErrorMsg(`Chargement incidents impossible : ${incidentError.message}`);
-      }
-    } else {
-      setIncidents((incidentData || []) as Incident[]);
+      setDashboardStatus(
+        normalizedError.kind === "config" ? "config-error" : "backend-unavailable"
+      );
+      setErrorMsg(getUserFacingSupabaseErrorMessage(normalizedError.kind));
     }
-
-    setLoading(false);
   };
 
   useEffect(() => {
@@ -109,39 +127,51 @@ console.log("KEY:", process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ? "OK" : "MANQUANT
 
     setSaving(true);
     const projectName = name.trim();
+    console.info("[FieldTrace][Home] Creating project", { projectName });
 
-    const { error } = await supabase.from("projects").insert({
-      name: projectName,
-      site_name: projectName,
-      client_name: clientName.trim() || null,
-      location: location.trim() || null,
-      status: "active",
-    });
+    try {
+      const supabase = getSupabaseBrowserClient();
+      const { error } = await supabase.from("projects").insert({
+        name: projectName,
+        site_name: projectName,
+        client_name: clientName.trim() || null,
+        location: location.trim() || null,
+        status: "active",
+      });
 
-    setSaving(false);
-
-    if (error) {
-      if (error.message.toLowerCase().includes("duplicate")) {
-        setErrorMsg("Un projet avec ce nom existe déjà.");
-      } else {
-        setErrorMsg(error.message);
+      if (error) {
+        if (error.message.toLowerCase().includes("duplicate")) {
+          setErrorMsg("Un projet avec ce nom existe déjà.");
+        } else {
+          setErrorMsg(error.message);
+        }
+        console.warn("[FieldTrace][Home] Project creation rejected", error);
+        return;
       }
-      return;
-    }
 
-    setName("");
-    setClientName("");
-    setLocation("");
-    setSuccessMsg("Projet créé avec succès.");
-    loadData();
+      setName("");
+      setClientName("");
+      setLocation("");
+      setSuccessMsg("Projet créé avec succès.");
+      console.info("[FieldTrace][Home] Project created successfully", { projectName });
+      await loadData();
+    } catch (error) {
+      const normalizedError = normalizeSupabaseError(error);
+      console.error("[FieldTrace][Home] Project creation failed", normalizedError);
+      setErrorMsg(getUserFacingSupabaseErrorMessage(normalizedError.kind));
+    } finally {
+      setSaving(false);
+    }
   };
 
   const stats = useMemo(() => {
-    const openIncidents = incidents.filter((i) => (i.status || "open") !== "closed");
-    const closedIncidents = incidents.filter((i) => (i.status || "open") === "closed");
-    const activePriorityIncidents = incidents.filter((i) => (i.status || "open") !== "closed");
+    const openIncidents = incidents.filter((incident) => (incident.status || "open") !== "closed");
+    const closedIncidents = incidents.filter((incident) => (incident.status || "open") === "closed");
+    const activePriorityIncidents = incidents.filter(
+      (incident) => (incident.status || "open") !== "closed"
+    );
     const criticalIncidents = activePriorityIncidents.filter(
-      (i) => (i.priority || "").toLowerCase() === "critical"
+      (incident) => (incident.priority || "").toLowerCase() === "critical"
     );
 
     return {
@@ -150,13 +180,23 @@ console.log("KEY:", process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ? "OK" : "MANQUANT
       criticalIncidents: criticalIncidents.length,
       totalIncidents: incidents.length,
       byPriority: {
-        critical: activePriorityIncidents.filter((i) => (i.priority || "").toLowerCase() === "critical").length,
-        high: activePriorityIncidents.filter((i) => (i.priority || "").toLowerCase() === "high").length,
-        medium: activePriorityIncidents.filter((i) => (i.priority || "").toLowerCase() === "medium").length,
-        low: activePriorityIncidents.filter((i) => (i.priority || "").toLowerCase() === "low").length,
+        critical: activePriorityIncidents.filter(
+          (incident) => (incident.priority || "").toLowerCase() === "critical"
+        ).length,
+        high: activePriorityIncidents.filter(
+          (incident) => (incident.priority || "").toLowerCase() === "high"
+        ).length,
+        medium: activePriorityIncidents.filter(
+          (incident) => (incident.priority || "").toLowerCase() === "medium"
+        ).length,
+        low: activePriorityIncidents.filter(
+          (incident) => (incident.priority || "").toLowerCase() === "low"
+        ).length,
       },
     };
   }, [incidents]);
+
+  const metricValue = (value: number) => (dashboardStatus === "ready" ? value : "—");
 
   return (
     <main className="min-h-screen bg-slate-100">
@@ -179,9 +219,7 @@ console.log("KEY:", process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ? "OK" : "MANQUANT
                   <p className="text-xs uppercase tracking-[0.25em] text-slate-300">
                     terrain intelligence platform
                   </p>
-                  <h1 className="mt-1 text-3xl font-bold tracking-tight md:text-4xl">
-                    FieldTrace
-                  </h1>
+                  <h1 className="mt-1 text-3xl font-bold tracking-tight md:text-4xl">FieldTrace</h1>
                   <p className="mt-2 max-w-2xl text-sm text-slate-300 md:text-base">
                     Plateforme terrain pour piloter les incidents, formaliser les réserves,
                     sécuriser la traçabilité photo et générer des livrables PDF professionnels
@@ -214,11 +252,36 @@ console.log("KEY:", process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ? "OK" : "MANQUANT
           )}
 
           <section className="grid gap-4 sm:grid-cols-2 xl:grid-cols-5">
-            <StatCard title="Projets" value={projects.length} subtitle="Portefeuille actif" valueClassName="text-slate-900" />
-            <StatCard title="Incidents ouverts" value={stats.openIncidents} subtitle="Suivi terrain" valueClassName="text-slate-900" />
-            <StatCard title="Incidents clôturés" value={stats.closedIncidents} subtitle="Actions finalisées" valueClassName="text-emerald-700" />
-            <StatCard title="Incidents critiques" value={stats.criticalIncidents} subtitle="Arbitrage immédiat" valueClassName="text-red-700" />
-            <StatCard title="Total incidents" value={stats.totalIncidents} subtitle="Vision consolidée" valueClassName="text-slate-900" />
+            <StatCard
+              title="Projets"
+              value={metricValue(projects.length)}
+              subtitle="Portefeuille actif"
+              valueClassName="text-slate-900"
+            />
+            <StatCard
+              title="Incidents ouverts"
+              value={metricValue(stats.openIncidents)}
+              subtitle="Suivi terrain"
+              valueClassName="text-slate-900"
+            />
+            <StatCard
+              title="Incidents clôturés"
+              value={metricValue(stats.closedIncidents)}
+              subtitle="Actions finalisées"
+              valueClassName="text-emerald-700"
+            />
+            <StatCard
+              title="Incidents critiques"
+              value={metricValue(stats.criticalIncidents)}
+              subtitle="Arbitrage immédiat"
+              valueClassName="text-red-700"
+            />
+            <StatCard
+              title="Total incidents"
+              value={metricValue(stats.totalIncidents)}
+              subtitle="Vision consolidée"
+              valueClassName="text-slate-900"
+            />
           </section>
 
           <section className="grid gap-6 xl:grid-cols-[1.35fr_1fr]">
@@ -228,9 +291,7 @@ console.log("KEY:", process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ? "OK" : "MANQUANT
                   <p className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-500">
                     onboarding projet
                   </p>
-                  <h2 className="mt-1 text-2xl font-bold text-slate-900">
-                    Créer un nouveau projet
-                  </h2>
+                  <h2 className="mt-1 text-2xl font-bold text-slate-900">Créer un nouveau projet</h2>
                   <p className="mt-1 text-slate-600">
                     Crée un projet terrain en moins de 30 secondes depuis PC, tablette ou téléphone.
                   </p>
@@ -246,19 +307,19 @@ console.log("KEY:", process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ? "OK" : "MANQUANT
                   className="rounded-2xl border border-slate-300 bg-white p-3 text-black placeholder-gray-400 outline-none transition focus:border-slate-500"
                   placeholder="Nom du projet"
                   value={name}
-                  onChange={(e) => setName(e.target.value)}
+                  onChange={(event) => setName(event.target.value)}
                 />
                 <input
                   className="rounded-2xl border border-slate-300 bg-white p-3 text-black placeholder-gray-400 outline-none transition focus:border-slate-500"
                   placeholder="Client"
                   value={clientName}
-                  onChange={(e) => setClientName(e.target.value)}
+                  onChange={(event) => setClientName(event.target.value)}
                 />
                 <input
                   className="rounded-2xl border border-slate-300 bg-white p-3 text-black placeholder-gray-400 outline-none transition focus:border-slate-500"
                   placeholder="Localisation"
                   value={location}
-                  onChange={(e) => setLocation(e.target.value)}
+                  onChange={(event) => setLocation(event.target.value)}
                 />
               </div>
 
@@ -281,15 +342,29 @@ console.log("KEY:", process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ? "OK" : "MANQUANT
               <p className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-500">
                 priorités actives
               </p>
-              <h2 className="mt-1 text-2xl font-bold text-slate-900">
-                Tableau de bord terrain
-              </h2>
+              <h2 className="mt-1 text-2xl font-bold text-slate-900">Tableau de bord terrain</h2>
 
               <div className="mt-6 grid grid-cols-2 gap-4">
-                <PriorityCard label="CRITIQUE" value={stats.byPriority.critical} valueClassName="text-red-700" />
-                <PriorityCard label="HIGH" value={stats.byPriority.high} valueClassName="text-orange-600" />
-                <PriorityCard label="MEDIUM" value={stats.byPriority.medium} valueClassName="text-amber-600" />
-                <PriorityCard label="LOW" value={stats.byPriority.low} valueClassName="text-emerald-700" />
+                <PriorityCard
+                  label="CRITIQUE"
+                  value={metricValue(stats.byPriority.critical)}
+                  valueClassName="text-red-700"
+                />
+                <PriorityCard
+                  label="HIGH"
+                  value={metricValue(stats.byPriority.high)}
+                  valueClassName="text-orange-600"
+                />
+                <PriorityCard
+                  label="MEDIUM"
+                  value={metricValue(stats.byPriority.medium)}
+                  valueClassName="text-amber-600"
+                />
+                <PriorityCard
+                  label="LOW"
+                  value={metricValue(stats.byPriority.low)}
+                  valueClassName="text-emerald-700"
+                />
               </div>
 
               <div className="mt-4 rounded-2xl bg-slate-50 p-4 text-sm text-slate-600">
@@ -307,29 +382,44 @@ console.log("KEY:", process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ? "OK" : "MANQUANT
                 </p>
                 <h2 className="mt-1 text-2xl font-bold text-slate-900">Projets</h2>
                 <p className="mt-1 text-slate-600">
-                  Ouvre un projet pour gérer les incidents, générer des claims unitaires et préparer les livrables client.
+                  Ouvre un projet pour gérer les incidents, générer des claims unitaires et préparer
+                  les livrables client.
                 </p>
               </div>
 
               <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-medium text-slate-700">
-                {projects.length} projet(s)
+                {dashboardStatus === "loading" ? "Chargement en cours" : `${projects.length} projet(s)`}
               </span>
             </div>
 
-            {loading ? (
+            {dashboardStatus === "loading" ? (
               <div className="rounded-2xl border border-slate-200 bg-slate-50 p-6 text-slate-600">
-                Chargement...
+                Chargement en cours des projets et incidents...
+              </div>
+            ) : dashboardStatus === "config-error" ? (
+              <div className="rounded-2xl border border-amber-200 bg-amber-50 p-6 text-amber-900">
+                Erreur de configuration. Vérifiez les variables d’environnement Vercel.
+              </div>
+            ) : dashboardStatus === "backend-unavailable" ? (
+              <div className="rounded-2xl border border-red-200 bg-red-50 p-6 text-red-700">
+                Backend indisponible. Impossible de charger les données pour le moment.
               </div>
             ) : projects.length === 0 ? (
               <div className="rounded-2xl border border-slate-200 bg-slate-50 p-6 text-slate-600">
-                Aucun projet trouvé. Crée ton premier projet ci-dessus.
+                Aucun projet trouvé. Créez votre premier projet ci-dessus.
               </div>
             ) : (
               <div className="grid gap-4 lg:grid-cols-2">
                 {projects.map((project) => {
-                  const projectIncidents = incidents.filter((i) => i.project_id === project.id);
-                  const projectOpen = projectIncidents.filter((i) => (i.status || "open") !== "closed").length;
-                  const projectClosed = projectIncidents.filter((i) => (i.status || "open") === "closed").length;
+                  const projectIncidents = incidents.filter(
+                    (incident) => incident.project_id === project.id
+                  );
+                  const projectOpen = projectIncidents.filter(
+                    (incident) => (incident.status || "open") !== "closed"
+                  ).length;
+                  const projectClosed = projectIncidents.filter(
+                    (incident) => (incident.status || "open") === "closed"
+                  ).length;
 
                   return (
                     <div
@@ -338,7 +428,9 @@ console.log("KEY:", process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ? "OK" : "MANQUANT
                     >
                       <div className="flex items-start justify-between gap-4">
                         <div>
-                          <h3 className="text-xl font-semibold text-slate-900">{project.display_name}</h3>
+                          <h3 className="text-xl font-semibold text-slate-900">
+                            {project.display_name}
+                          </h3>
                           <div className="mt-2 space-y-1 text-sm text-slate-600">
                             <p>Client : {project.client_name || "N/A"}</p>
                             <p>Localisation : {project.location || "N/A"}</p>
@@ -358,14 +450,12 @@ console.log("KEY:", process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ? "OK" : "MANQUANT
                       </div>
 
                       <div className="mt-5 flex flex-wrap gap-2">
-                        <button
-                          onClick={() => {
-                            window.location.href = `/project/${project.id}`;
-                          }}
+                        <Link
+                          href={`/project/${project.id}`}
                           className="rounded-xl bg-slate-900 px-4 py-2 text-sm text-white"
                         >
                           Ouvrir le projet
-                        </button>
+                        </Link>
 
                         <button
                           onClick={() =>
@@ -393,8 +483,9 @@ console.log("KEY:", process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ? "OK" : "MANQUANT
           </section>
 
           <footer className="pb-2 text-center text-[10px] leading-4 text-slate-400">
-            © {new Date().getFullYear()} FieldTrace. Concept, structure fonctionnelle, interface et logique applicative réservés.
-            Toute reproduction, adaptation ou exploitation non autorisée est interdite.
+            © {new Date().getFullYear()} FieldTrace. Concept, structure fonctionnelle, interface et
+            logique applicative réservés. Toute reproduction, adaptation ou exploitation non
+            autorisée est interdite.
           </footer>
         </div>
       </div>
@@ -409,7 +500,7 @@ function StatCard({
   valueClassName,
 }: {
   title: string;
-  value: number;
+  value: number | string;
   subtitle: string;
   valueClassName?: string;
 }) {
@@ -428,7 +519,7 @@ function PriorityCard({
   valueClassName,
 }: {
   label: string;
-  value: number;
+  value: number | string;
   valueClassName?: string;
 }) {
   return (
