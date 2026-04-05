@@ -23,6 +23,7 @@ type IncidentLike = {
   close_photo_url?: string | null;
   closed_by_name?: string | null;
   created_at?: string | null;
+  updated_at?: string | null;
   closed_at?: string | null;
 };
 
@@ -31,7 +32,7 @@ function projectName(project: ProjectLike) {
 }
 
 function formatDate(value?: string | null) {
-  if (!value) return "N/A";
+  if (!value) return "Non renseigné";
   try {
     return new Date(value).toLocaleString("fr-FR");
   } catch {
@@ -62,6 +63,44 @@ function addWrappedText(doc: jsPDF, text: string, x: number, y: number, width: n
   const lines = doc.splitTextToSize(text || "", width);
   doc.text(lines, x, y);
   return y + lines.length * 5.5;
+}
+
+function ensurePageSpace(doc: jsPDF, y: number, needed: number) {
+  if (y + needed > 282) {
+    doc.addPage();
+    return 20;
+  }
+  return y;
+}
+
+function addSectionTitle(doc: jsPDF, title: string, y: number) {
+  doc.setFont("helvetica", "bold");
+  doc.setFontSize(13);
+  doc.text(title, 14, y);
+  return y + 7;
+}
+
+function addInfoGrid(
+  doc: jsPDF,
+  entries: Array<{ label: string; value: string }>,
+  startY: number
+) {
+  let y = startY;
+  entries.forEach((entry, index) => {
+    const column = index % 2;
+    const row = Math.floor(index / 2);
+    const x = column === 0 ? 14 : 108;
+    const cellY = y + row * 18;
+    doc.setDrawColor(220, 226, 235);
+    doc.roundedRect(x, cellY, 88, 14, 3, 3);
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(8);
+    doc.text(entry.label, x + 3, cellY + 5);
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(9);
+    doc.text(doc.splitTextToSize(entry.value || "Non renseigné", 80), x + 3, cellY + 10);
+  });
+  return y + Math.ceil(entries.length / 2) * 18;
 }
 
 async function imageUrlToPngDataUrl(url: string): Promise<string | null> {
@@ -142,9 +181,9 @@ export async function generateProjectReportPdf(project: ProjectLike, incidents: 
   doc.setFont("helvetica", "normal");
   doc.setFontSize(11);
   doc.text(`Projet : ${name}`, 14, 52);
-  doc.text(`Client : ${project.client_name || "N/A"}`, 14, 60);
-  doc.text(`Localisation : ${project.location || "N/A"}`, 14, 68);
-  doc.text(`Statut : ${project.status || "N/A"}`, 14, 76);
+  doc.text(`Client : ${project.client_name || "Non renseigné"}`, 14, 60);
+  doc.text(`Localisation : ${project.location || "Non renseigné"}`, 14, 68);
+  doc.text(`Statut : ${project.status || "Non renseigné"}`, 14, 76);
   doc.text(`Date d'édition : ${new Date().toLocaleString("fr-FR")}`, 14, 84);
 
   const openCount = incidents.filter((i) => (i.status || "open") !== "closed").length;
@@ -197,9 +236,9 @@ export async function generateProjectReportPdf(project: ProjectLike, incidents: 
 
       doc.setFont("helvetica", "normal");
       doc.text(`Statut : ${incident.status || "open"}`, 18, y + 16);
-      doc.text(`Priorité : ${incident.priority || "N/A"}`, 70, y + 16);
-      doc.text(`Catégorie : ${incident.category || "N/A"}`, 120, y + 16);
-      doc.text(`Déclaré par : ${incident.reporter_name || "N/A"}`, 18, y + 24);
+      doc.text(`Priorité : ${incident.priority || "Non renseigné"}`, 70, y + 16);
+      doc.text(`Catégorie : ${incident.category || "Non renseigné"}`, 120, y + 16);
+      doc.text(`Déclaré par : ${incident.reporter_name || "Non renseigné"}`, 18, y + 24);
       doc.text(`Créé le : ${formatDate(incident.created_at)}`, 100, y + 24);
 
       if (photoDataUrl && photoDim) {
@@ -236,8 +275,8 @@ export async function generateIncidentClaimPdf(project: ProjectLike, incident: I
   y = addWrappedText(
     doc,
     `Projet : ${name}
-Client : ${project.client_name || "N/A"}
-Localisation : ${project.location || "N/A"}
+Client : ${project.client_name || "Non renseigné"}
+Localisation : ${project.location || "Non renseigné"}
 Date d'édition : ${new Date().toLocaleString("fr-FR")}`,
     14,
     y,
@@ -267,11 +306,11 @@ Date d'édition : ${new Date().toLocaleString("fr-FR")}`,
   y = addWrappedText(
     doc,
     `Titre : ${incident.title}
-Catégorie : ${incident.category || "N/A"}
-Priorité : ${incident.priority || "N/A"}
+Catégorie : ${incident.category || "Non renseigné"}
+Priorité : ${incident.priority || "Non renseigné"}
 Statut : ${incident.status || "open"}
-Zone : ${incident.location || "N/A"}
-Déclaré par : ${incident.reporter_name || "N/A"}
+Zone : ${incident.location || "Non renseigné"}
+Déclaré par : ${incident.reporter_name || "Non renseigné"}
 Créé le : ${formatDate(incident.created_at)}
 
 Commentaire initial :
@@ -325,11 +364,11 @@ ${incident.description || "Sans commentaire initial"}`,
 
     y = addWrappedText(
       doc,
-      `Clôturé par : ${incident.closed_by_name || "N/A"}
+      `Clôturé par : ${incident.closed_by_name || "Non renseigné"}
 Clôturé le : ${formatDate(incident.closed_at)}
 
 Commentaire de clôture :
-${incident.close_comment || "N/A"}`,
+${incident.close_comment || "Non renseigné"}`,
       14,
       y,
       180
@@ -371,14 +410,14 @@ export function buildIncidentClaimMailText(project: ProjectLike, incident: Incid
     `Veuillez trouver ci-dessous la synthèse du point ouvert identifié sur le projet ${name}.`,
     "",
     `Projet : ${name}`,
-    `Client : ${project.client_name || "N/A"}`,
-    `Localisation : ${project.location || "N/A"}`,
+    `Client : ${project.client_name || "Non renseigné"}`,
+    `Localisation : ${project.location || "Non renseigné"}`,
     `Titre incident : ${incident.title}`,
-    `Catégorie : ${incident.category || "N/A"}`,
-    `Priorité : ${incident.priority || "N/A"}`,
+    `Catégorie : ${incident.category || "Non renseigné"}`,
+    `Priorité : ${incident.priority || "Non renseigné"}`,
     `Statut : ${incident.status || "open"}`,
-    `Zone : ${incident.location || "N/A"}`,
-    `Déclaré par : ${incident.reporter_name || "N/A"}`,
+    `Zone : ${incident.location || "Non renseigné"}`,
+    `Déclaré par : ${incident.reporter_name || "Non renseigné"}`,
     `Créé le : ${formatDate(incident.created_at)}`,
     "",
     "Commentaire initial :",

@@ -33,9 +33,15 @@ export function getSupabaseBrowserClient() {
   }
 
   if (!browserClient) {
-    console.info("[FieldTrace][Supabase] Initializing browser client", {
-      urlHost: new URL(supabaseUrl).host,
-    });
+    try {
+      new URL(supabaseUrl);
+    } catch (error) {
+      throw new FieldTraceSupabaseError(
+        "config",
+        "Configuration Supabase invalide. NEXT_PUBLIC_SUPABASE_URL doit être une URL valide.",
+        error
+      );
+    }
 
     browserClient = createClient(supabaseUrl, supabaseAnonKey);
   }

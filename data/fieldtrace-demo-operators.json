@@ -1,0 +1,28 @@
+{
+  "operators": [
+    {
+      "id": "demo-operator-sophie-laurent",
+      "firstName": "Sophie",
+      "lastName": "Laurent",
+      "role": "Chef d'équipe",
+      "email": "sophie.laurent@atlas-industrie.fr",
+      "phone": "0600000101"
+    },
+    {
+      "id": "demo-operator-david-morel",
+      "firstName": "David",
+      "lastName": "Morel",
+      "role": "Responsable maintenance",
+      "email": "david.morel@atlas-industrie.fr",
+      "phone": "0600000102"
+    },
+    {
+      "id": "demo-operator-jean-dupont",
+      "firstName": "Jean",
+      "lastName": "Dupont",
+      "role": "Opérateur terrain",
+      "email": "jean.dupont@atlas-industrie.fr",
+      "phone": "0600000103"
+    }
+  ]
+}

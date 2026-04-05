@@ -1,4 +1,5 @@
 import "./globals.css";
+import { AppStatusBar } from "@/components/app-status-bar";
 
 export const metadata = {
   title: "FieldTrace",
@@ -13,7 +14,10 @@ export default function RootLayout({
 }) {
   return (
     <html lang="fr">
-      <body>{children}</body>
+      <body className="min-h-screen bg-[#0b1220] text-slate-100 antialiased">
+        <AppStatusBar />
+        {children}
+      </body>
     </html>
   );
 }

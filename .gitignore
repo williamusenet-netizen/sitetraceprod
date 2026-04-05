@@ -36,6 +36,11 @@ yarn-error.log*
 # vercel
 .vercel
 
+# internal QA / release prep
+/docs/internal/
+/scripts/internal/
+/data/internal/
+
 # typescript
 *.tsbuildinfo
 next-env.d.ts
