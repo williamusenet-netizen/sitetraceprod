@@ -3311,9 +3311,50 @@ function ModalShell({
   children: ReactNode;
   onClose: () => void;
 }) {
+  const panelRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    const previousBodyOverflow = document.body.style.overflow;
+    const previousHtmlOverflow = document.documentElement.style.overflow;
+
+    document.body.style.overflow = "hidden";
+    document.documentElement.style.overflow = "hidden";
+    panelRef.current?.focus();
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        onClose();
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+      document.body.style.overflow = previousBodyOverflow;
+      document.documentElement.style.overflow = previousHtmlOverflow;
+    };
+  }, [onClose]);
+
   return (
-    <div className="fixed inset-0 z-[70] flex items-center justify-center bg-slate-950/75 px-4 py-8 backdrop-blur-sm">
-      <div className="w-full max-w-2xl rounded-[32px] border border-white/10 bg-[#0f172a] p-6 shadow-[0_30px_90px_rgba(2,6,23,0.55)]">
+    <div
+      className="fixed inset-0 z-[70] flex items-center justify-center bg-slate-950/80 px-4 py-4 backdrop-blur-sm sm:px-6 sm:py-6"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) {
+          onClose();
+        }
+      }}
+    >
+      <div
+        ref={panelRef}
+        role="dialog"
+        aria-modal="true"
+        aria-label={title}
+        tabIndex={-1}
+        onMouseDown={(event) => event.stopPropagation()}
+        className="flex w-full max-w-3xl max-h-[calc(100vh-2rem)] flex-col overflow-hidden rounded-[32px] border border-white/10 bg-[#0f172a] p-6 shadow-[0_30px_90px_rgba(2,6,23,0.55)] outline-none sm:max-h-[calc(100vh-3rem)]"
+      >
         <div className="flex items-center justify-between gap-4">
           <h3 className="text-2xl font-semibold text-white">{title}</h3>
           <button
@@ -3324,7 +3365,7 @@ function ModalShell({
             Fermer
           </button>
         </div>
-        <div className="mt-5">{children}</div>
+        <div className="mt-5 overflow-y-auto pr-1">{children}</div>
       </div>
     </div>
   );
