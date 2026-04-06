@@ -458,7 +458,7 @@ export default function ProjectPage({
                 </div>
                 <div>
                   <Link
-                    href="/"
+                    href="/boss"
                     className="mb-3 inline-flex items-center gap-2 rounded-2xl border border-cyan-300/70 bg-cyan-400/15 px-5 py-2.5 text-sm font-semibold text-white shadow-[0_14px_32px_rgba(34,211,238,0.18)] ring-1 ring-white/10 transition hover:-translate-y-0.5 hover:border-cyan-200 hover:bg-cyan-300/20"
                   >
                     <span className="inline-flex h-7 w-7 items-center justify-center rounded-full bg-white/16 text-base">
@@ -1252,7 +1252,7 @@ function ProjectStatusScreen({
               {errorMsg ? <p className="mt-3 text-sm font-medium">{errorMsg}</p> : null}
             </div>
 
-            <Link href="/" className="inline-flex rounded-xl bg-slate-900 px-4 py-2 text-sm text-white">
+            <Link href="/boss" className="inline-flex rounded-xl bg-slate-900 px-4 py-2 text-sm text-white">
               Retour accueil
             </Link>
           </div>
