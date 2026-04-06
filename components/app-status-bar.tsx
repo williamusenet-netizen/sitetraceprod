@@ -50,6 +50,8 @@ function getPageLabel(pathname: string) {
 export function AppStatusBar() {
   const pathname = usePathname();
   const [now, setNow] = useState<ReturnType<typeof formatDateTime> | null>(null);
+  const [isOperationMobile, setIsOperationMobile] = useState(false);
+  const [isOperationHeaderCollapsed, setIsOperationHeaderCollapsed] = useState(false);
 
   useEffect(() => {
     setNow(formatDateTime(new Date()));
@@ -61,6 +63,52 @@ export function AppStatusBar() {
     return () => window.clearInterval(intervalId);
   }, []);
 
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    const mediaQuery = window.matchMedia("(max-width: 767px)");
+    const updateMobileState = () => {
+      setIsOperationMobile(pathname.startsWith("/operation/") && mediaQuery.matches);
+    };
+
+    updateMobileState();
+    if (typeof mediaQuery.addEventListener === "function") {
+      mediaQuery.addEventListener("change", updateMobileState);
+    } else {
+      mediaQuery.addListener(updateMobileState);
+    }
+
+    return () => {
+      if (typeof mediaQuery.removeEventListener === "function") {
+        mediaQuery.removeEventListener("change", updateMobileState);
+      } else {
+        mediaQuery.removeListener(updateMobileState);
+      }
+    };
+  }, [pathname]);
+
+  useEffect(() => {
+    setIsOperationHeaderCollapsed(false);
+  }, [pathname]);
+
+  useEffect(() => {
+    if (!isOperationMobile) return;
+
+    const collapseHeader = () => setIsOperationHeaderCollapsed(true);
+
+    window.addEventListener("scroll", collapseHeader, { passive: true });
+    window.addEventListener("pointerdown", collapseHeader, { passive: true });
+    window.addEventListener("touchstart", collapseHeader, { passive: true });
+    document.addEventListener("focusin", collapseHeader);
+
+    return () => {
+      window.removeEventListener("scroll", collapseHeader);
+      window.removeEventListener("pointerdown", collapseHeader);
+      window.removeEventListener("touchstart", collapseHeader);
+      document.removeEventListener("focusin", collapseHeader);
+    };
+  }, [isOperationMobile]);
+
   const pageLabel = getPageLabel(pathname);
   const mainTitle =
     pathname.startsWith("/boss")
@@ -71,6 +119,52 @@ export function AppStatusBar() {
 
   if (pathname === "/") {
     return null;
+  }
+
+  if (isOperationMobile) {
+    return (
+      <div
+        className={`sticky top-0 z-50 bg-[#0b1220]/92 backdrop-blur-xl transition-all duration-300 ${
+          isOperationHeaderCollapsed ? "px-2 py-2" : "px-3 py-3"
+        }`}
+      >
+        <div
+          className={`mx-auto w-full rounded-[24px] border border-white/10 bg-[#111827]/95 shadow-[0_10px_30px_rgba(2,6,23,0.35)] transition-all duration-300 ${
+            isOperationHeaderCollapsed ? "px-3 py-2" : "px-4 py-3"
+          }`}
+        >
+          <div className="flex items-center justify-between gap-3">
+            <div className="min-w-0">
+              <Link
+                href="/"
+                className="text-[11px] uppercase tracking-[0.22em] text-sky-300 transition hover:text-sky-200"
+              >
+                FieldTrace
+              </Link>
+              <div className="mt-1 flex items-center gap-2">
+                <p className="truncate text-sm font-semibold text-slate-50">Incident terrain</p>
+                <span className="rounded-full border border-white/10 bg-white/5 px-2 py-0.5 text-[10px] uppercase tracking-[0.18em] text-slate-300">
+                  Mobile
+                </span>
+              </div>
+              {!isOperationHeaderCollapsed ? (
+                <p className="mt-1 text-xs text-slate-400">Accès direct FieldTrace depuis l'assignation.</p>
+              ) : null}
+            </div>
+
+            <div className="shrink-0 text-right">
+              {!isOperationHeaderCollapsed ? (
+                <>
+                  <div className="text-[10px] uppercase tracking-[0.18em] text-slate-400">Ouvert dans</div>
+                  <div className="mt-1 text-xs font-medium text-slate-200">Opération terrain</div>
+                </>
+              ) : null}
+              <div className="mt-1 text-sm font-semibold text-slate-50">{now?.timeLabel || "--:--:--"}</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
   }
 
   return (
