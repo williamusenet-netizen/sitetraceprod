@@ -42,6 +42,17 @@ type RawProject = {
   created_at?: string | null;
 };
 
+type RawOperator = {
+  id: string;
+  first_name?: string | null;
+  last_name?: string | null;
+  role?: string | null;
+  email?: string | null;
+  phone?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+};
+
 type Project = {
   id: string;
   displayName: string;
@@ -119,6 +130,8 @@ type DemoOperatorSeed = {
 };
 
 const OPERATOR_STORAGE_KEY = "fieldtrace:boss:operators";
+const OPERATORS_TABLE_SELECT =
+  "id, first_name, last_name, role, email, phone, created_at, updated_at";
 const DEMO_OPERATOR_SEED = ((demoOperators as { operators?: DemoOperatorSeed[] }).operators || []).map(
   (operator) => ({
     id: operator.id,
@@ -171,6 +184,58 @@ function incidentRef(id: string) {
 
 function operatorLabel(operator: Operator) {
   return `${operator.firstName} ${operator.lastName}`.trim();
+}
+
+function operatorIdentityKey(operator: Operator) {
+  const email = operator.email.trim().toLowerCase();
+  if (email) return `email:${email}`;
+
+  return `name:${operator.firstName.trim().toLowerCase()}|${operator.lastName
+    .trim()
+    .toLowerCase()}|${normalizePhoneNumber(operator.phone)}`;
+}
+
+function dedupeOperators(operators: Operator[]) {
+  const seen = new Set<string>();
+
+  return operators.filter((operator) => {
+    const key = operatorIdentityKey(operator);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function mapRawOperator(raw: RawOperator): Operator {
+  return {
+    id: raw.id,
+    firstName: raw.first_name?.trim() || "",
+    lastName: raw.last_name?.trim() || "",
+    role: raw.role?.trim() || "",
+    email: raw.email?.trim() || "",
+    phone: raw.phone?.trim() || "",
+  };
+}
+
+function mapOperatorToInsertPayload(operator: Operator) {
+  return {
+    id: operator.id,
+    first_name: operator.firstName.trim(),
+    last_name: operator.lastName.trim(),
+    role: operator.role.trim(),
+    email: operator.email.trim().toLowerCase(),
+    phone: operator.phone.trim(),
+  };
+}
+
+function isOperatorsTableMissingError(error: unknown) {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    typeof (error as { code?: unknown }).code === "string" &&
+    (error as { code: string }).code === "PGRST205"
+  );
 }
 
 function formatDate(value?: string | null) {
@@ -342,7 +407,7 @@ export function BossWorkbench() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [incidents, setIncidents] = useState<Incident[]>([]);
   const [operators, setOperators] = useState<Operator[]>([]);
-  const [operatorsLoaded, setOperatorsLoaded] = useState(false);
+  const [operatorsMode, setOperatorsMode] = useState<"supabase" | "local-fallback">("local-fallback");
   const [errorMsg, setErrorMsg] = useState("");
   const [successMsg, setSuccessMsg] = useState("");
   const [isBusy, setIsBusy] = useState(false);
@@ -374,16 +439,105 @@ export function BossWorkbench() {
   const [pendingDeleteOperatorId, setPendingDeleteOperatorId] = useState<string | null>(null);
   const selectedIncidentPanelRef = useRef<HTMLDivElement | null>(null);
 
-  useEffect(() => {
-    const stored = loadStoredOperators();
-    setOperators(stored.length > 0 ? stored : DEMO_OPERATOR_SEED);
-    setOperatorsLoaded(true);
-  }, []);
+  const loadOperators = async () => {
+    try {
+      const supabase = getSupabaseBrowserClient();
+      const { data, error } = await supabase
+        .from("operators")
+        .select(OPERATORS_TABLE_SELECT)
+        .order("last_name", { ascending: true })
+        .order("first_name", { ascending: true });
 
-  useEffect(() => {
-    if (!operatorsLoaded) return;
-    saveStoredOperators(operators);
-  }, [operators, operatorsLoaded]);
+      if (error) {
+        if (isOperatorsTableMissingError(error)) {
+          const localOperators = loadStoredOperators();
+          const nextOperators = dedupeOperators(
+            localOperators.length > 0 ? localOperators : DEMO_OPERATOR_SEED
+          );
+          setOperators(nextOperators);
+          setOperatorsMode("local-fallback");
+          return;
+        }
+
+        throw error;
+      }
+
+      let remoteOperators = dedupeOperators(((data || []) as RawOperator[]).map(mapRawOperator));
+      const localOperators = dedupeOperators(loadStoredOperators());
+
+      if (remoteOperators.length === 0) {
+        const bootstrapOperators = localOperators.length > 0 ? localOperators : DEMO_OPERATOR_SEED;
+
+        if (bootstrapOperators.length > 0) {
+          const bootstrapResult = await supabase
+            .from("operators")
+            .insert(bootstrapOperators.map(mapOperatorToInsertPayload))
+            .select(OPERATORS_TABLE_SELECT);
+
+          if (!bootstrapResult.error) {
+            remoteOperators = dedupeOperators(
+              ((bootstrapResult.data || []) as RawOperator[]).map(mapRawOperator)
+            );
+          } else {
+            const reloadResult = await supabase
+              .from("operators")
+              .select(OPERATORS_TABLE_SELECT)
+              .order("last_name", { ascending: true })
+              .order("first_name", { ascending: true });
+
+            if (!reloadResult.error) {
+              remoteOperators = dedupeOperators(
+                ((reloadResult.data || []) as RawOperator[]).map(mapRawOperator)
+              );
+            }
+          }
+        }
+      } else if (localOperators.length > 0) {
+        const remoteKeys = new Set(remoteOperators.map(operatorIdentityKey));
+        const missingLocalOperators = localOperators.filter(
+          (operator) => !remoteKeys.has(operatorIdentityKey(operator))
+        );
+
+        if (missingLocalOperators.length > 0) {
+          const insertResult = await supabase
+            .from("operators")
+            .insert(missingLocalOperators.map(mapOperatorToInsertPayload))
+            .select(OPERATORS_TABLE_SELECT);
+
+          if (!insertResult.error) {
+            remoteOperators = dedupeOperators([
+              ...remoteOperators,
+              ...((insertResult.data || []) as RawOperator[]).map(mapRawOperator),
+            ]);
+          } else {
+            const reloadResult = await supabase
+              .from("operators")
+              .select(OPERATORS_TABLE_SELECT)
+              .order("last_name", { ascending: true })
+              .order("first_name", { ascending: true });
+
+            if (!reloadResult.error) {
+              remoteOperators = dedupeOperators(
+                ((reloadResult.data || []) as RawOperator[]).map(mapRawOperator)
+              );
+            }
+          }
+        }
+      }
+
+      const nextOperators = remoteOperators.length > 0 ? remoteOperators : DEMO_OPERATOR_SEED;
+      setOperators(nextOperators);
+      setOperatorsMode("supabase");
+      saveStoredOperators(nextOperators);
+    } catch {
+      const localOperators = loadStoredOperators();
+      const nextOperators = dedupeOperators(
+        localOperators.length > 0 ? localOperators : DEMO_OPERATOR_SEED
+      );
+      setOperators(nextOperators);
+      setOperatorsMode("local-fallback");
+    }
+  };
 
   const loadData = async () => {
     setDashboardStatus("loading");
@@ -430,6 +584,10 @@ export function BossWorkbench() {
 
   useEffect(() => {
     void loadData();
+  }, []);
+
+  useEffect(() => {
+    void loadOperators();
   }, []);
 
   const records = useMemo(() => {
@@ -1050,7 +1208,7 @@ export function BossWorkbench() {
     const firstName = operatorFirstName.trim();
     const lastName = operatorLastName.trim();
     const role = operatorRole.trim();
-    const email = operatorEmail.trim();
+    const email = operatorEmail.trim().toLowerCase();
     const phone = operatorPhone.trim();
 
     if (!editingOperatorId) {
@@ -1063,9 +1221,35 @@ export function BossWorkbench() {
         phone,
       };
 
-      setOperators((current) => [nextOperator, ...current]);
+      if (operatorsMode === "supabase") {
+        setIsBusy(true);
+
+        try {
+          const supabase = getSupabaseBrowserClient();
+          const { error } = await supabase
+            .from("operators")
+            .insert(mapOperatorToInsertPayload(nextOperator));
+
+          if (error) throw error;
+
+          await loadOperators();
+          resetOperatorForm();
+          setSuccessMsg("Opérateur enregistré et disponible pour assignation.");
+          return;
+        } catch (error) {
+          const normalizedError = normalizeSupabaseError(error);
+          setErrorMsg(getUserFacingSupabaseErrorMessage(normalizedError.kind));
+          return;
+        } finally {
+          setIsBusy(false);
+        }
+      }
+
+      const nextOperators = [nextOperator, ...operators];
+      setOperators(nextOperators);
+      saveStoredOperators(nextOperators);
       resetOperatorForm();
-      setSuccessMsg("Opérateur enregistre et disponible pour assignation.");
+      setSuccessMsg("Opérateur enregistré localement et disponible pour assignation.");
       return;
     }
 
@@ -1102,16 +1286,34 @@ export function BossWorkbench() {
         if (error) throw error;
       }
 
-      setOperators((current) =>
-        current.map((operator) => (operator.id === editingOperatorId ? updatedOperator : operator))
-      );
+      if (operatorsMode === "supabase") {
+        const supabase = getSupabaseBrowserClient();
+        const { error } = await supabase
+          .from("operators")
+          .update(mapOperatorToInsertPayload(updatedOperator))
+          .eq("id", editingOperatorId);
+
+        if (error) throw error;
+
+        await loadOperators();
+      } else {
+        const nextOperators = operators.map((operator) =>
+          operator.id === editingOperatorId ? updatedOperator : operator
+        );
+        setOperators(nextOperators);
+        saveStoredOperators(nextOperators);
+      }
 
       if (previousLabel !== nextLabel) {
         await loadData();
       }
 
       resetOperatorForm();
-      setSuccessMsg("Opérateur mis a jour.");
+      setSuccessMsg(
+        operatorsMode === "supabase"
+          ? "Opérateur mis à jour et synchronisé."
+          : "Opérateur mis à jour localement."
+      );
     } catch (error) {
       const normalizedError = normalizeSupabaseError(error);
       setErrorMsg(getUserFacingSupabaseErrorMessage(normalizedError.kind));
@@ -1146,9 +1348,23 @@ export function BossWorkbench() {
         if (error) throw error;
       }
 
-      setOperators((current) =>
-        current.filter((operator) => operator.id !== pendingDeleteOperator.id)
-      );
+      if (operatorsMode === "supabase") {
+        const supabase = getSupabaseBrowserClient();
+        const { error } = await supabase
+          .from("operators")
+          .delete()
+          .eq("id", pendingDeleteOperator.id);
+
+        if (error) throw error;
+
+        await loadOperators();
+      } else {
+        const nextOperators = operators.filter(
+          (operator) => operator.id !== pendingDeleteOperator.id
+        );
+        setOperators(nextOperators);
+        saveStoredOperators(nextOperators);
+      }
 
       if (editingOperatorId === pendingDeleteOperator.id) {
         resetOperatorForm();
@@ -1162,7 +1378,9 @@ export function BossWorkbench() {
       setSuccessMsg(
         pendingDeleteAssignedCount > 0
           ? "Contact supprimé. Les incidents associés sont revenus en non assigné."
-          : "Contact supprimé."
+          : operatorsMode === "supabase"
+            ? "Contact supprimé et synchronisé."
+            : "Contact supprimé."
       );
     } catch (error) {
       const normalizedError = normalizeSupabaseError(error);
