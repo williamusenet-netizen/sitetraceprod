@@ -56,8 +56,16 @@ type Incident = {
 type TerrainScreen = "home" | "create" | "follow" | "detail";
 type TerrainStatus = "loading" | "ready" | "config-error" | "backend-unavailable";
 type EntryKind = "incident" | "non_conformite";
+type AssignmentChannel = "email" | "sms";
 type IncidentPriority = "critical" | "high" | "medium" | "low";
 type IncidentStatus = "open" | "in_progress" | "closed";
+type AssignmentTarget = {
+  id: string;
+  title: string;
+  emplacementName: string;
+  priority?: string | null;
+  status?: string | null;
+};
 
 const OPERATORS_TABLE_SELECT = "id, first_name, last_name, role, email, phone";
 
@@ -199,6 +207,65 @@ function statusLabel(status?: string | null) {
   if (value === "in_progress") return "IN_PROGRESS";
   if (value === "closed") return "CLOSED";
   return "OPEN";
+}
+
+function normalizePhoneNumber(phone: string) {
+  const trimmed = phone.trim();
+  if (!trimmed) return "";
+
+  const hasPlusPrefix = trimmed.startsWith("+");
+  const digitsOnly = trimmed.replace(/[^\d]/g, "");
+  if (!digitsOnly) return "";
+
+  return hasPlusPrefix ? `+${digitsOnly}` : digitsOnly;
+}
+
+function buildOperationUrl(incidentId: string) {
+  const path = `/operation/${incidentId}`;
+  if (typeof window === "undefined") return path;
+  return `${window.location.origin}${path}`;
+}
+
+function buildAssignmentEmailSubject(target: AssignmentTarget) {
+  return `Assignation incident ${incidentReference(target.id)} - ${target.title}`;
+}
+
+function buildAssignmentMessage(target: AssignmentTarget, operator: Operator, channel: AssignmentChannel) {
+  const incidentUrl = buildOperationUrl(target.id);
+
+  if (channel === "sms") {
+    return [
+      `Bonjour ${operator.firstName},`,
+      `incident ${incidentReference(target.id)} assigné.`,
+      target.title,
+      target.emplacementName,
+      `${priorityLabel(target.priority)} / ${statusLabel(target.status)}`,
+      `Accéder : ${incidentUrl}`,
+      "Merci de prendre en charge ce point.",
+    ].join(" ");
+  }
+
+  return [
+    `Bonjour ${operator.firstName},`,
+    "",
+    `Vous êtes assigné à l'incident N°${incidentReference(target.id)}.`,
+    `Titre : ${target.title}`,
+    `Emplacement : ${target.emplacementName}`,
+    `Criticité : ${priorityLabel(target.priority)}`,
+    `Statut : ${statusLabel(target.status)}`,
+    "",
+    `Accéder au problème : ${incidentUrl}`,
+    "",
+    "Merci de prendre en charge ce point.",
+  ].join("\n");
+}
+
+function buildMailtoLink(email: string, subject: string, body: string) {
+  return `mailto:${email}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+}
+
+function buildSmsLink(phone: string, body: string) {
+  return `sms:${phone}?body=${encodeURIComponent(body)}`;
 }
 
 function formatDate(value?: string | null) {
@@ -355,6 +422,8 @@ export function TerrainDirectPage({
   const [showClosureDialog, setShowClosureDialog] = useState(false);
   const [showAssignDialog, setShowAssignDialog] = useState(false);
   const [assignmentOperatorId, setAssignmentOperatorId] = useState("");
+  const [assignmentChannel, setAssignmentChannel] = useState<AssignmentChannel>("email");
+  const [assignmentTarget, setAssignmentTarget] = useState<AssignmentTarget | null>(null);
   const [closureName, setClosureName] = useState("");
   const [closureDate, setClosureDate] = useState(todayLocalInputValue());
   const [closureComment, setClosureComment] = useState("");
@@ -486,6 +555,19 @@ export function TerrainDirectPage({
     [incidentsWithEmplacement, selectedIncidentId]
   );
 
+  const selectedAssignmentOperator = useMemo(
+    () => operators.find((operator) => operator.id === assignmentOperatorId) || null,
+    [assignmentOperatorId, operators]
+  );
+
+  const canDeliverAssignment = useMemo(() => {
+    if (!assignmentTarget || !selectedAssignmentOperator) return false;
+    if (assignmentChannel === "sms") {
+      return Boolean(normalizePhoneNumber(selectedAssignmentOperator.phone));
+    }
+    return Boolean(selectedAssignmentOperator.email.trim());
+  }, [assignmentChannel, assignmentTarget, selectedAssignmentOperator]);
+
   useEffect(() => {
     if (!initialIncidentId || hasAppliedInitialIncident || terrainStatus !== "ready") return;
 
@@ -529,6 +611,7 @@ export function TerrainDirectPage({
     setSelectedIncidentId("");
     setShowNoPhotoDialog(false);
     setShowClosureDialog(false);
+    setShowAssignDialog(false);
   };
 
   const resetCreateFlow = (kind: EntryKind) => {
@@ -664,11 +747,42 @@ export function TerrainDirectPage({
       const { error } = await supabase.from("incidents").insert(payload);
       if (error) throw error;
 
+      let createdIncident: Incident | null = null;
+      if (selectedAssignee) {
+        const { data } = await supabase
+          .from("incidents")
+          .select("id, project_id, title, category, priority, status, assignee, created_at, updated_at")
+          .eq("project_id", selectedEmplacement.id)
+          .eq("title", draftTitle.trim())
+          .eq("assignee", operatorLabel(selectedAssignee))
+          .order("created_at", { ascending: false })
+          .limit(1)
+          .maybeSingle();
+
+        createdIncident = (data as Incident | null) || null;
+      }
+
       await loadData({ quiet: true });
       goHome();
+      if (selectedAssignee && createdIncident) {
+        setAssignmentOperatorId(selectedAssignee.id);
+        setAssignmentChannel("email");
+        setAssignmentTarget({
+          id: createdIncident.id,
+          title: createdIncident.title,
+          emplacementName: emplacementLabel(selectedEmplacement),
+          priority: createdIncident.priority || draftPriority,
+          status: createdIncident.status || "open",
+        });
+      }
       setMessage({
         tone: "success",
-        text: entryKind === "incident" ? "Incident enregistré." : "Non-conformité enregistrée.",
+        text:
+          selectedAssignee && createdIncident
+            ? "Incident enregistré et assigné. Choisissez le canal d'envoi."
+            : entryKind === "incident"
+              ? "Incident enregistré."
+              : "Non-conformité enregistrée.",
       });
     } catch (error) {
       setMessage({
@@ -780,6 +894,7 @@ export function TerrainDirectPage({
     const currentOperator =
       operators.find((operator) => operatorLabel(operator) === selectedIncident.assignee) || null;
     setAssignmentOperatorId(currentOperator?.id || operators[0]?.id || "");
+    setAssignmentChannel("email");
     setShowAssignDialog(true);
     setMessage(null);
   };
@@ -813,7 +928,14 @@ export function TerrainDirectPage({
 
       await loadData({ quiet: true });
       setShowAssignDialog(false);
-      setMessage({ tone: "success", text: `Incident assigné à ${assignee}.` });
+      setAssignmentTarget({
+        id: selectedIncident.id,
+        title: selectedIncident.title,
+        emplacementName: emplacementLabel(selectedIncident.emplacement || { id: "", name: "", site_name: "" }),
+        priority: selectedIncident.priority,
+        status: selectedIncident.status,
+      });
+      setMessage({ tone: "success", text: `Incident assigné à ${assignee}. Choisissez le canal d'envoi.` });
     } catch (error) {
       setMessage({
         tone: "error",
@@ -866,6 +988,48 @@ export function TerrainDirectPage({
     } finally {
       setIsBusy(false);
     }
+  };
+
+  const deliverAssignment = () => {
+    if (!assignmentTarget || !selectedAssignmentOperator) {
+      setMessage({ tone: "error", text: "Assignation introuvable. Réessayez depuis l'incident." });
+      return;
+    }
+
+    if (!canDeliverAssignment) {
+      setMessage({
+        tone: "error",
+        text:
+          assignmentChannel === "sms"
+            ? "Téléphone manquant pour cet opérateur."
+            : "Email manquant pour cet opérateur.",
+      });
+      return;
+    }
+
+    const messageBody = buildAssignmentMessage(
+      assignmentTarget,
+      selectedAssignmentOperator,
+      assignmentChannel
+    );
+    const targetLink =
+      assignmentChannel === "sms"
+        ? buildSmsLink(normalizePhoneNumber(selectedAssignmentOperator.phone), messageBody)
+        : buildMailtoLink(
+            selectedAssignmentOperator.email.trim(),
+            buildAssignmentEmailSubject(assignmentTarget),
+            messageBody
+          );
+
+    window.location.href = targetLink;
+    setAssignmentTarget(null);
+    setMessage({
+      tone: "success",
+      text:
+        assignmentChannel === "sms"
+          ? "SMS préparé dans l'application de messagerie."
+          : "Mail préparé dans votre client de messagerie.",
+    });
   };
 
   if (terrainStatus !== "ready") {
@@ -1437,7 +1601,7 @@ export function TerrainDirectPage({
         <ModalShell>
           <h3 className="text-xl font-bold text-slate-900">Assigner l'incident</h3>
           <p className="mt-3 text-sm leading-6 text-slate-600">
-            Choisissez l'opérateur responsable. L'assignation sera visible immédiatement dans le mode bureau.
+            Choisissez l'opérateur responsable puis le canal de notification.
           </p>
 
           <div className="mt-4 rounded-[20px] border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-700">
@@ -1460,10 +1624,74 @@ export function TerrainDirectPage({
             ))}
           </select>
 
+          <div className="mt-4 grid grid-cols-2 gap-3">
+            <ChoiceButton
+              selected={assignmentChannel === "email"}
+              onClick={() => setAssignmentChannel("email")}
+              label="Envoyer par mail"
+            />
+            <ChoiceButton
+              selected={assignmentChannel === "sms"}
+              onClick={() => setAssignmentChannel("sms")}
+              label="Envoyer par SMS"
+            />
+          </div>
+
           <div className="mt-5 grid grid-cols-2 gap-3">
             <SecondaryButton onClick={() => setShowAssignDialog(false)}>Annuler</SecondaryButton>
             <PrimaryButton onClick={assignSelectedIncident} disabled={isBusy}>
-              {isBusy ? "Assignation..." : "Assigner"}
+              {isBusy
+                ? "Assignation..."
+                : assignmentChannel === "sms"
+                  ? "Assigner + SMS"
+                  : "Assigner + mail"}
+            </PrimaryButton>
+          </div>
+        </ModalShell>
+      ) : null}
+
+      {assignmentTarget && selectedAssignmentOperator ? (
+        <ModalShell>
+          <h3 className="text-xl font-bold text-slate-900">Notifier l'opérateur</h3>
+          <p className="mt-3 text-sm leading-6 text-slate-600">
+            L'incident est assigné. Choisissez le canal pour ouvrir un message prérempli.
+          </p>
+
+          <div className="mt-4 rounded-[20px] border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-700">
+            <div className="font-semibold text-slate-900">{assignmentTarget.title}</div>
+            <div className="mt-1">{incidentReference(assignmentTarget.id)}</div>
+            <div className="mt-1">Opérateur : {operatorLabel(selectedAssignmentOperator)}</div>
+          </div>
+
+          <div className="mt-4 grid grid-cols-2 gap-3">
+            <ChoiceButton
+              selected={assignmentChannel === "email"}
+              onClick={() => setAssignmentChannel("email")}
+              label="Mail"
+            />
+            <ChoiceButton
+              selected={assignmentChannel === "sms"}
+              onClick={() => setAssignmentChannel("sms")}
+              label="SMS"
+            />
+          </div>
+
+          <div className="mt-4 max-h-44 overflow-y-auto whitespace-pre-wrap rounded-[20px] border border-slate-200 bg-slate-50 px-4 py-3 text-xs leading-5 text-slate-700">
+            {buildAssignmentMessage(assignmentTarget, selectedAssignmentOperator, assignmentChannel)}
+          </div>
+
+          {!canDeliverAssignment ? (
+            <div className="mt-3 rounded-[18px] border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+              {assignmentChannel === "sms"
+                ? "Téléphone manquant pour cet opérateur."
+                : "Email manquant pour cet opérateur."}
+            </div>
+          ) : null}
+
+          <div className="mt-5 grid grid-cols-2 gap-3">
+            <SecondaryButton onClick={() => setAssignmentTarget(null)}>Plus tard</SecondaryButton>
+            <PrimaryButton onClick={deliverAssignment} disabled={!canDeliverAssignment}>
+              {assignmentChannel === "sms" ? "Ouvrir le SMS" : "Ouvrir le mail"}
             </PrimaryButton>
           </div>
         </ModalShell>
