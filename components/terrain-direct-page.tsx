@@ -17,6 +17,24 @@ type Emplacement = {
   created_at?: string | null;
 };
 
+type RawOperator = {
+  id: string;
+  first_name?: string | null;
+  last_name?: string | null;
+  role?: string | null;
+  email?: string | null;
+  phone?: string | null;
+};
+
+type Operator = {
+  id: string;
+  firstName: string;
+  lastName: string;
+  role: string;
+  email: string;
+  phone: string;
+};
+
 type Incident = {
   id: string;
   project_id: string;
@@ -25,6 +43,7 @@ type Incident = {
   category?: string | null;
   priority?: string | null;
   status?: string | null;
+  assignee?: string | null;
   initial_photo_url?: string | null;
   close_comment?: string | null;
   close_photo_url?: string | null;
@@ -40,8 +59,25 @@ type EntryKind = "incident" | "non_conformite";
 type IncidentPriority = "critical" | "high" | "medium" | "low";
 type IncidentStatus = "open" | "in_progress" | "closed";
 
+const OPERATORS_TABLE_SELECT = "id, first_name, last_name, role, email, phone";
+
 function emplacementLabel(emplacement: Emplacement) {
   return emplacement.site_name || emplacement.name || "Emplacement sans nom";
+}
+
+function operatorLabel(operator: Operator) {
+  return `${operator.firstName} ${operator.lastName}`.trim();
+}
+
+function mapRawOperator(raw: RawOperator): Operator {
+  return {
+    id: raw.id,
+    firstName: raw.first_name?.trim() || "",
+    lastName: raw.last_name?.trim() || "",
+    role: raw.role?.trim() || "",
+    email: raw.email?.trim() || "",
+    phone: raw.phone?.trim() || "",
+  };
 }
 
 function mapEmplacements(items: Emplacement[]) {
@@ -298,6 +334,7 @@ export function TerrainDirectPage({
   const [message, setMessage] = useState<{ tone: "success" | "error"; text: string } | null>(null);
   const [emplacements, setEmplacements] = useState<Emplacement[]>([]);
   const [incidents, setIncidents] = useState<Incident[]>([]);
+  const [operators, setOperators] = useState<Operator[]>([]);
   const [entryKind, setEntryKind] = useState<EntryKind>("incident");
   const [createStep, setCreateStep] = useState<1 | 2 | 3>(1);
   const [selectedEmplacementId, setSelectedEmplacementId] = useState("");
@@ -308,6 +345,7 @@ export function TerrainDirectPage({
   const [draftTitle, setDraftTitle] = useState("");
   const [draftDescription, setDraftDescription] = useState("");
   const [draftPriority, setDraftPriority] = useState<IncidentPriority>("medium");
+  const [draftAssignee, setDraftAssignee] = useState("");
   const [draftPhotoFile, setDraftPhotoFile] = useState<File | null>(null);
   const [showNoPhotoDialog, setShowNoPhotoDialog] = useState(false);
   const [followQuery, setFollowQuery] = useState("");
@@ -315,6 +353,8 @@ export function TerrainDirectPage({
   const [followComment, setFollowComment] = useState("");
   const [followPhotoFile, setFollowPhotoFile] = useState<File | null>(null);
   const [showClosureDialog, setShowClosureDialog] = useState(false);
+  const [showAssignDialog, setShowAssignDialog] = useState(false);
+  const [assignmentOperatorId, setAssignmentOperatorId] = useState("");
   const [closureName, setClosureName] = useState("");
   const [closureDate, setClosureDate] = useState(todayLocalInputValue());
   const [closureComment, setClosureComment] = useState("");
@@ -338,7 +378,7 @@ export function TerrainDirectPage({
         supabase
           .from("incidents")
           .select(
-            "id, project_id, title, description, category, priority, status, initial_photo_url, close_comment, close_photo_url, closed_by_name, created_at, updated_at, closed_at"
+            "id, project_id, title, description, category, priority, status, assignee, initial_photo_url, close_comment, close_photo_url, closed_by_name, created_at, updated_at, closed_at"
           )
           .order("updated_at", { ascending: false, nullsFirst: false })
           .order("created_at", { ascending: false }),
@@ -364,6 +404,30 @@ export function TerrainDirectPage({
 
   useEffect(() => {
     loadData();
+  }, []);
+
+  const loadOperators = async () => {
+    try {
+      const supabase = getSupabaseBrowserClient();
+      const { data, error } = await supabase
+        .from("operators")
+        .select(OPERATORS_TABLE_SELECT)
+        .order("last_name", { ascending: true })
+        .order("first_name", { ascending: true });
+
+      if (error) {
+        setOperators([]);
+        return;
+      }
+
+      setOperators(((data || []) as RawOperator[]).map(mapRawOperator));
+    } catch {
+      setOperators([]);
+    }
+  };
+
+  useEffect(() => {
+    loadOperators();
   }, []);
 
   const selectedEmplacement = useMemo(
@@ -478,6 +542,7 @@ export function TerrainDirectPage({
     setDraftTitle("");
     setDraftDescription("");
     setDraftPriority("medium");
+    setDraftAssignee("");
     setDraftPhotoFile(null);
     setScreen("create");
     setMessage(null);
@@ -587,6 +652,11 @@ export function TerrainDirectPage({
         updated_at: new Date().toISOString(),
       };
 
+      const selectedAssignee = operators.find((operator) => operator.id === draftAssignee) || null;
+      if (selectedAssignee) {
+        payload.assignee = operatorLabel(selectedAssignee);
+      }
+
       if (draftPhotoFile) {
         payload.initial_photo_url = await uploadIncidentPhoto(draftPhotoFile, "initial");
       }
@@ -686,6 +756,64 @@ export function TerrainDirectPage({
 
       await loadData({ quiet: true });
       setMessage({ tone: "success", text: `Statut mis a jour en ${statusLabel(nextStatus)}.` });
+    } catch (error) {
+      setMessage({
+        tone: "error",
+        text: getOperationErrorMessage(error),
+      });
+    } finally {
+      setIsBusy(false);
+    }
+  };
+
+  const openAssignDialog = () => {
+    if (!selectedIncident) return;
+
+    if (operators.length === 0) {
+      setMessage({
+        tone: "error",
+        text: "Aucun opérateur disponible. Ajoutez d'abord un opérateur dans le mode bureau.",
+      });
+      return;
+    }
+
+    const currentOperator =
+      operators.find((operator) => operatorLabel(operator) === selectedIncident.assignee) || null;
+    setAssignmentOperatorId(currentOperator?.id || operators[0]?.id || "");
+    setShowAssignDialog(true);
+    setMessage(null);
+  };
+
+  const assignSelectedIncident = async () => {
+    if (!selectedIncident) return;
+
+    const selectedOperator =
+      operators.find((operator) => operator.id === assignmentOperatorId) || null;
+
+    if (!selectedOperator) {
+      setMessage({ tone: "error", text: "Choisissez un opérateur avant d'assigner." });
+      return;
+    }
+
+    setIsBusy(true);
+    setMessage(null);
+
+    try {
+      const supabase = getSupabaseBrowserClient();
+      const assignee = operatorLabel(selectedOperator);
+      const { error } = await supabase
+        .from("incidents")
+        .update({
+          assignee,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", selectedIncident.id);
+
+      if (error) throw error;
+
+      await loadData({ quiet: true });
+      setShowAssignDialog(false);
+      setMessage({ tone: "success", text: `Incident assigné à ${assignee}.` });
     } catch (error) {
       setMessage({
         tone: "error",
@@ -937,6 +1065,29 @@ export function TerrainDirectPage({
                   </div>
                 </div>
 
+                {operators.length > 0 ? (
+                  <div className="mt-4 space-y-2">
+                    <label className="text-sm font-semibold text-slate-700">
+                      Assigner maintenant
+                    </label>
+                    <select
+                      value={draftAssignee}
+                      onChange={(event) => setDraftAssignee(event.target.value)}
+                      className="w-full rounded-[22px] border border-slate-200 bg-slate-50 px-4 py-4 text-base text-slate-900 outline-none focus:border-sky-300 focus:bg-white"
+                    >
+                      <option value="">Non assigné pour le moment</option>
+                      {operators.map((operator) => (
+                        <option key={operator.id} value={operator.id}>
+                          {operatorLabel(operator)} - {operator.role}
+                        </option>
+                      ))}
+                    </select>
+                    <p className="text-xs leading-5 text-slate-500">
+                      Optionnel : l'assignation reste visible dans le mode bureau.
+                    </p>
+                  </div>
+                ) : null}
+
                 <div className="mt-5 grid grid-cols-2 gap-3">
                   <SecondaryButton onClick={() => setCreateStep(1)}>Retour</SecondaryButton>
                   <PrimaryButton
@@ -1069,6 +1220,7 @@ export function TerrainDirectPage({
               onClick={() => {
                 setScreen("follow");
                 setShowClosureDialog(false);
+                setShowAssignDialog(false);
               }}
               label="Retour à la liste"
             />
@@ -1104,6 +1256,7 @@ export function TerrainDirectPage({
 
               <div className="mt-4 grid grid-cols-2 gap-3 text-sm">
                 <InfoTile label="Statut" value={statusLabel(selectedIncident.status)} />
+                <InfoTile label="Assigné à" value={selectedIncident.assignee || "Non assigné"} />
                 <InfoTile label="Créé le" value={formatDate(selectedIncident.created_at)} />
                 <InfoTile label="Mis à jour" value={formatDate(selectedIncident.updated_at || selectedIncident.created_at)} />
                 <InfoTile label="Clôturé le" value={formatDate(selectedIncident.closed_at)} />
@@ -1160,6 +1313,12 @@ export function TerrainDirectPage({
               ) : null}
 
               <div className="mt-5 space-y-3">
+                {normalizeStatus(selectedIncident.status) !== "closed" ? (
+                  <PrimaryButton onClick={openAssignDialog} disabled={isBusy}>
+                    Assigner
+                  </PrimaryButton>
+                ) : null}
+
                 <PrimaryButton onClick={saveFollowUpdate} disabled={isBusy}>
                   {isBusy ? "Enregistrement..." : "Enregistrer les modifications"}
                 </PrimaryButton>
@@ -1269,6 +1428,42 @@ export function TerrainDirectPage({
             <SecondaryButton onClick={() => setShowClosureDialog(false)}>Annuler</SecondaryButton>
             <PrimaryButton onClick={closeIncident} disabled={isBusy}>
               Valider la clôture
+            </PrimaryButton>
+          </div>
+        </ModalShell>
+      ) : null}
+
+      {showAssignDialog && selectedIncident ? (
+        <ModalShell>
+          <h3 className="text-xl font-bold text-slate-900">Assigner l'incident</h3>
+          <p className="mt-3 text-sm leading-6 text-slate-600">
+            Choisissez l'opérateur responsable. L'assignation sera visible immédiatement dans le mode bureau.
+          </p>
+
+          <div className="mt-4 rounded-[20px] border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-700">
+            <div className="font-semibold text-slate-900">{selectedIncident.title}</div>
+            <div className="mt-1">{incidentReference(selectedIncident.id)}</div>
+            <div className="mt-1">
+              Assigné actuellement : {selectedIncident.assignee || "Non assigné"}
+            </div>
+          </div>
+
+          <select
+            value={assignmentOperatorId}
+            onChange={(event) => setAssignmentOperatorId(event.target.value)}
+            className="mt-4 w-full rounded-[22px] border border-slate-200 bg-slate-50 px-4 py-4 text-base text-slate-900 outline-none"
+          >
+            {operators.map((operator) => (
+              <option key={operator.id} value={operator.id}>
+                {operatorLabel(operator)} - {operator.role}
+              </option>
+            ))}
+          </select>
+
+          <div className="mt-5 grid grid-cols-2 gap-3">
+            <SecondaryButton onClick={() => setShowAssignDialog(false)}>Annuler</SecondaryButton>
+            <PrimaryButton onClick={assignSelectedIncident} disabled={isBusy}>
+              {isBusy ? "Assignation..." : "Assigner"}
             </PrimaryButton>
           </div>
         </ModalShell>
