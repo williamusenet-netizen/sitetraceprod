@@ -1,0 +1,156 @@
+-- PROPOSITION - NE PAS EXECUTER SANS VALIDATION
+-- FieldTrace V3 - Durcissement progressif RLS avant vraie production
+--
+-- Objectif:
+-- - documenter les policies actuellement trop ouvertes;
+-- - proposer une trajectoire de durcissement sans perte de donnees;
+-- - eviter toute interruption terrain non anticipee.
+--
+-- GARDE-FOU:
+-- Ce fichier declenche volontairement une erreur s'il est execute en entier.
+-- Les blocs SQL ci-dessous sont des propositions a relire, adapter et executer
+-- par etapes uniquement apres backup DB + Storage et validation metier.
+
+do $$
+begin
+  raise exception 'PROPOSITION ONLY - do not execute prod-rls-hardening-proposal.sql without explicit validation';
+end $$;
+
+-- ============================================================================
+-- 1. Audit read-only prealable
+-- ============================================================================
+--
+-- select
+--   schemaname,
+--   tablename,
+--   policyname,
+--   roles,
+--   cmd,
+--   qual,
+--   with_check
+-- from pg_policies
+-- where schemaname in ('public', 'storage')
+-- order by schemaname, tablename, policyname;
+--
+-- select
+--   schemaname,
+--   tablename,
+--   rowsecurity
+-- from pg_tables
+-- where schemaname in ('public', 'storage')
+-- order by schemaname, tablename;
+--
+-- select 'projects' as table_name, count(*)::int as row_count from public.projects
+-- union all select 'incidents', count(*)::int from public.incidents
+-- union all select 'operators', count(*)::int from public.operators
+-- union all select 'attachments', count(*)::int from public.attachments;
+--
+-- select
+--   id,
+--   name,
+--   public,
+--   file_size_limit,
+--   allowed_mime_types
+-- from storage.buckets
+-- order by id;
+
+-- ============================================================================
+-- 2. Risques actuels observes en pre-prod
+-- ============================================================================
+--
+-- A. public.projects
+--    Policies actuelles: SELECT / INSERT / UPDATE pour role public avec true.
+--    Risque: n'importe quel client anon peut lire, creer et modifier les projets.
+--
+-- B. public.incidents
+--    Policies actuelles: SELECT / INSERT / UPDATE pour role public avec true.
+--    Risque: n'importe quel client anon peut lire, creer et modifier les incidents.
+--    Note: la suppression directe incidents n'est pas exposee par policy; elle passe
+--    par la RPC public.delete_incident_with_password(uuid, text).
+--
+-- C. public.operators
+--    Policies actuelles: SELECT / INSERT / UPDATE / DELETE pour anon/authenticated.
+--    Risque: suppression et modification operateurs depuis un client anon.
+--
+-- D. storage.objects bucket incident-photos
+--    Policies actuelles: public SELECT et public INSERT sur incident-photos.
+--    Risque: lecture publique de tout media qui a une URL; upload public possible.
+--
+-- E. Tables annexes claims/evidences/events/weekly_reports
+--    Certaines tables existent en base mais ne sont pas couvertes par le repo.
+--    Ne pas drop, truncate ou recreer. A auditer avant activation produit.
+
+-- ============================================================================
+-- 3. Etape 1 proposee: proteger /boss cote application avant RLS stricte
+-- ============================================================================
+--
+-- Deja prepare cote app via proxy.ts:
+-- - FIELDTRACE_BOSS_USER optionnel, defaut: fieldtrace
+-- - FIELDTRACE_BOSS_PASSWORD obligatoire en prod
+-- - protection uniquement sur /boss
+--
+-- Cette etape ne change pas la base et garde les flux terrain existants.
+
+-- ============================================================================
+-- 4. Etape 2 proposee: retirer le DELETE anon sur operators
+-- ============================================================================
+--
+-- A executer uniquement apres validation que la suppression operateur doit passer
+-- par un flux admin protege ou une RPC dediee.
+--
+-- begin;
+-- drop policy if exists operators_delete_public on public.operators;
+-- notify pgrst, 'reload schema';
+-- commit;
+
+-- ============================================================================
+-- 5. Etape 3 proposee: remplacer les writes publics par RPC metier
+-- ============================================================================
+--
+-- Principe:
+-- - conserver SELECT public si les flux terrain doivent lister les projets/incidents;
+-- - remplacer INSERT/UPDATE public par des RPC ciblees qui valident les champs;
+-- - garder compatibilite ascendante pendant une fenetre de transition.
+--
+-- Exemple de trajectoire, A NE PAS EXECUTER TEL QUEL:
+--
+-- begin;
+-- -- 1) creer des RPC create_incident, update_incident_status, upload-proof metadata
+-- -- 2) deployer l'app qui utilise ces RPC
+-- -- 3) verifier logs et smoke tests terrain
+-- -- 4) seulement ensuite retirer les policies INSERT/UPDATE public
+-- -- drop policy if exists "public insert incidents" on public.incidents;
+-- -- drop policy if exists "public update incidents" on public.incidents;
+-- -- drop policy if exists "public insert projects" on public.projects;
+-- -- drop policy if exists "public update projects" on public.projects;
+-- -- notify pgrst, 'reload schema';
+-- commit;
+
+-- ============================================================================
+-- 6. Etape 4 proposee: storage
+-- ============================================================================
+--
+-- Court terme:
+-- - conserver incident-photos public si les URLs publiques sont deja stockees en DB;
+-- - ajouter des limites MIME/taille sur le bucket via Dashboard apres inventaire;
+-- - ne supprimer aucun objet storage.
+--
+-- Moyen terme:
+-- - passer les nouveaux medias sensibles dans un bucket prive;
+-- - stocker les chemins fichiers plutot que des URLs publiques;
+-- - servir via signed URLs a duree courte.
+--
+-- Ne pas rendre incident-photos prive sans migration des URLs existantes, car cela
+-- casserait les photos deja referencees par initial_photo_url / close_photo_url.
+
+-- ============================================================================
+-- 7. Checklist avant toute execution RLS
+-- ============================================================================
+--
+-- [ ] Backup DB verifie et restaurable.
+-- [ ] Inventaire Storage par bucket exporte.
+-- [ ] Aucun incident de production en cours de saisie pendant la fenetre.
+-- [ ] Smoke tests terrain prets: creation, lecture, update statut, upload photo.
+-- [ ] Smoke tests boss prets: acces protege, assignation, suppression RPC.
+-- [ ] Plan rollback applicatif Vercel identifie.
+-- [ ] Plan rollback DB selectif documente; pas de restore aveugle sur base live.

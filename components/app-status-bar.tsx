@@ -54,13 +54,17 @@ export function AppStatusBar() {
   const [isOperationHeaderCollapsed, setIsOperationHeaderCollapsed] = useState(false);
 
   useEffect(() => {
-    setNow(formatDateTime(new Date()));
-
-    const intervalId = window.setInterval(() => {
+    const updateNow = () => {
       setNow(formatDateTime(new Date()));
-    }, 1000);
+    };
 
-    return () => window.clearInterval(intervalId);
+    const timeoutId = window.setTimeout(updateNow, 0);
+    const intervalId = window.setInterval(updateNow, 1000);
+
+    return () => {
+      window.clearTimeout(timeoutId);
+      window.clearInterval(intervalId);
+    };
   }, []);
 
   useEffect(() => {
@@ -88,7 +92,11 @@ export function AppStatusBar() {
   }, [pathname]);
 
   useEffect(() => {
-    setIsOperationHeaderCollapsed(false);
+    const timeoutId = window.setTimeout(() => {
+      setIsOperationHeaderCollapsed(false);
+    }, 0);
+
+    return () => window.clearTimeout(timeoutId);
   }, [pathname]);
 
   useEffect(() => {
@@ -170,8 +178,8 @@ export function AppStatusBar() {
   return (
     <div className="sticky top-0 z-50 bg-[#0b1220]/92 px-3 py-4 shadow-[0_14px_40px_rgba(2,6,23,0.45)] backdrop-blur-xl sm:px-4 md:px-5 lg:px-6 xl:px-8">
       <div className="mx-auto w-full max-w-[2160px] rounded-[28px] border border-white/10 bg-[#111827]/92 px-5 py-4 shadow-[0_10px_30px_rgba(2,6,23,0.35)]">
-        <div className="flex flex-col gap-4 xl:flex-row xl:items-center xl:justify-between">
-          <div>
+        <div className="flex min-w-0 flex-col gap-4 xl:flex-row xl:items-center xl:justify-between">
+          <div className="min-w-0">
             <Link
               href="/"
               className="text-xs uppercase tracking-[0.25em] text-sky-300 transition hover:text-sky-200"
@@ -186,7 +194,7 @@ export function AppStatusBar() {
             </div>
           </div>
 
-          <div className="rounded-2xl border border-white/10 bg-[#0b1220]/55 px-4 py-3 text-right">
+          <div className="w-full min-w-0 rounded-2xl border border-white/10 bg-[#0b1220]/55 px-4 py-3 text-left sm:text-right xl:w-auto xl:min-w-48">
             <div className="text-xs uppercase tracking-[0.2em] text-slate-400">Page active</div>
             <div className="mt-1 text-base font-semibold text-slate-50">{pageLabel}</div>
             <div className="mt-3 min-h-[20px] text-sm capitalize text-slate-400">

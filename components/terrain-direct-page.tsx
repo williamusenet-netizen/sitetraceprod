@@ -355,8 +355,8 @@ async function convertHeicIfNeeded(file: File): Promise<File> {
     return file;
   }
 
-  const module = await import("heic2any");
-  const heic2any = module.default;
+  const heicModule = await import("heic2any");
+  const heic2any = heicModule.default;
   const converted = await heic2any({
     blob: file,
     toType: "image/jpeg",

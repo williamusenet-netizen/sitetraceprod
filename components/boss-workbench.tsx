@@ -8,7 +8,6 @@ import {
   getUserFacingSupabaseErrorMessage,
   normalizeSupabaseError,
 } from "@/lib/supabase";
-import { generateProjectReportPdf } from "@/lib/pdf";
 import demoOperators from "@/data/fieldtrace-demo-operators.json";
 
 type DashboardStatus = "loading" | "ready" | "config-error" | "backend-unavailable";
@@ -130,6 +129,7 @@ type DemoOperatorSeed = {
 };
 
 const OPERATOR_STORAGE_KEY = "fieldtrace:boss:operators";
+const INCIDENT_DELETE_PASSWORD = "deletesuperuser";
 const OPERATORS_TABLE_SELECT =
   "id, first_name, last_name, role, email, phone, created_at, updated_at";
 const DEMO_OPERATOR_SEED = ((demoOperators as { operators?: DemoOperatorSeed[] }).operators || []).map(
@@ -236,6 +236,28 @@ function isOperatorsTableMissingError(error: unknown) {
     typeof (error as { code?: unknown }).code === "string" &&
     (error as { code: string }).code === "PGRST205"
   );
+}
+
+function getIncidentDeleteErrorMessage(error: unknown) {
+  const normalizedError = normalizeSupabaseError(error);
+
+  if (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    typeof (error as { code?: unknown }).code === "string"
+  ) {
+    const code = (error as { code: string }).code;
+    if (code === "PGRST202" || code === "42883") {
+      return "Suppression indisponible. Appliquez le script SQL delete-incident-with-password.sql sur Supabase.";
+    }
+
+    if (code === "42501") {
+      return "Mot de passe de suppression incorrect ou droits Supabase insuffisants.";
+    }
+  }
+
+  return getUserFacingSupabaseErrorMessage(normalizedError.kind);
 }
 
 function formatDate(value?: string | null) {
@@ -430,6 +452,9 @@ export function BossWorkbench() {
     title: string;
     subtitle: string;
   } | null>(null);
+  const [pendingDeleteIncidentId, setPendingDeleteIncidentId] = useState<string | null>(null);
+  const [incidentDeletePassword, setIncidentDeletePassword] = useState("");
+  const [incidentDeleteError, setIncidentDeleteError] = useState("");
   const [operatorFirstName, setOperatorFirstName] = useState("");
   const [operatorLastName, setOperatorLastName] = useState("");
   const [operatorRole, setOperatorRole] = useState("");
@@ -635,6 +660,10 @@ export function BossWorkbench() {
   const pendingDeleteOperator = useMemo(
     () => operators.find((operator) => operator.id === pendingDeleteOperatorId) || null,
     [pendingDeleteOperatorId, operators]
+  );
+  const pendingDeleteIncident = useMemo(
+    () => records.find((incident) => incident.id === pendingDeleteIncidentId) || null,
+    [pendingDeleteIncidentId, records]
   );
 
   const filteredIncidents = useMemo(
@@ -1170,6 +1199,71 @@ export function BossWorkbench() {
     }
   };
 
+  const openDeleteIncidentDialog = (incidentId: string) => {
+    setPendingDeleteIncidentId(incidentId);
+    setIncidentDeletePassword("");
+    setIncidentDeleteError("");
+    setErrorMsg("");
+    setSuccessMsg("");
+  };
+
+  const closeDeleteIncidentDialog = () => {
+    if (isBusy) return;
+    setPendingDeleteIncidentId(null);
+    setIncidentDeletePassword("");
+    setIncidentDeleteError("");
+  };
+
+  const confirmDeleteIncident = async () => {
+    if (!pendingDeleteIncident) {
+      setIncidentDeleteError("Incident introuvable pour la suppression.");
+      return;
+    }
+
+    if (incidentDeletePassword !== INCIDENT_DELETE_PASSWORD) {
+      setIncidentDeleteError("Mot de passe de suppression incorrect.");
+      return;
+    }
+
+    setIncidentDeleteError("");
+    setErrorMsg("");
+    setSuccessMsg("");
+    setIsBusy(true);
+
+    try {
+      const supabase = getSupabaseBrowserClient();
+      const { data, error } = await supabase.rpc("delete_incident_with_password", {
+        target_incident_id: pendingDeleteIncident.id,
+        delete_password: incidentDeletePassword,
+      });
+
+      if (error) throw error;
+
+      if (!data) {
+        setIncidentDeleteError("Aucun incident supprimé. Rechargez le bureau puis réessayez.");
+        return;
+      }
+
+      setIncidents((current) =>
+        current.filter((incident) => incident.id !== pendingDeleteIncident.id)
+      );
+      setSelectedIncidentId("");
+      setAssignmentDraft((current) =>
+        current?.incidentId === pendingDeleteIncident.id ? null : current
+      );
+      setActiveInsightKey(null);
+      setActiveReviewActionKey(null);
+      setPendingDeleteIncidentId(null);
+      setIncidentDeletePassword("");
+      setSuccessMsg(`Incident ${incidentRef(pendingDeleteIncident.id)} supprimé de la base.`);
+      await loadData();
+    } catch (error) {
+      setIncidentDeleteError(getIncidentDeleteErrorMessage(error));
+    } finally {
+      setIsBusy(false);
+    }
+  };
+
   const resetOperatorForm = () => {
     setEditingOperatorId(null);
     setOperatorFirstName("");
@@ -1584,6 +1678,8 @@ export function BossWorkbench() {
     setSuccessMsg("");
 
     try {
+      const { generateProjectReportPdf } = await import("@/lib/pdf");
+
       await generateProjectReportPdf(
         {
           id: project.id,
@@ -1686,7 +1782,7 @@ export function BossWorkbench() {
               </p>
             </div>
 
-            <div className="grid w-full max-w-xl grid-cols-2 gap-3 sm:grid-cols-4">
+            <div className="grid w-full max-w-xl grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
               <HeroMetric
                 eyebrow="Ouverts"
                 value={openActive.length}
@@ -1714,13 +1810,13 @@ export function BossWorkbench() {
             </div>
           </div>
 
-          <div className="mt-6 flex flex-wrap gap-3">
+          <div className="mt-6 flex gap-3 overflow-x-auto pb-1">
             {viewTabs.map((tab) => (
               <button
                 key={tab.id}
                 type="button"
                 onClick={() => setActiveView(tab.id)}
-                className={`rounded-full border px-4 py-2 text-sm font-medium transition ${
+                className={`shrink-0 rounded-full border px-4 py-2 text-sm font-medium transition ${
                   activeView === tab.id
                     ? "border-sky-400/70 bg-sky-400/15 text-sky-100"
                     : "border-white/10 bg-white/5 text-slate-300 hover:border-white/20 hover:bg-white/10"
@@ -2650,6 +2746,9 @@ export function BossWorkbench() {
                     >
                       Ouvrir le dossier complet
                     </Link>
+                    <BoardDangerButton onClick={() => openDeleteIncidentDialog(selectedIncident.id)}>
+                      Supprimer l'incident
+                    </BoardDangerButton>
                   </div>
 
                   <div className="grid gap-2 sm:grid-cols-3">
@@ -2910,6 +3009,59 @@ export function BossWorkbench() {
                   ))
                 )}
               </div>
+            </div>
+          </div>
+        </ModalShell>
+      ) : null}
+
+      {pendingDeleteIncident ? (
+        <ModalShell title="Supprimer incident" onClose={closeDeleteIncidentDialog}>
+          <div className="space-y-5">
+            <div className="rounded-2xl border border-red-500/25 bg-red-500/10 p-4">
+              <p className="text-sm leading-7 text-red-50">
+                Vous allez supprimer définitivement{" "}
+                <strong>{incidentRef(pendingDeleteIncident.id)}</strong> de la base de données.
+              </p>
+              <p className="mt-3 text-sm leading-7 text-slate-200">
+                {pendingDeleteIncident.title} · {projectLabel(pendingDeleteIncident.project)}
+              </p>
+            </div>
+
+            <div className="rounded-2xl border border-white/10 bg-[#08101d] p-4 text-sm leading-7 text-slate-300">
+              Cette action retire l&apos;incident du portefeuille bureau et du suivi terrain. Elle est réservée aux
+              incidents mal déclarés, doublons ou données à corriger hors historique.
+            </div>
+
+            <label className="block">
+              <span className="mb-2 block text-xs uppercase tracking-[0.24em] text-slate-400">
+                Mot de passe de suppression
+              </span>
+              <input
+                type="password"
+                value={incidentDeletePassword}
+                onChange={(event) => {
+                  setIncidentDeletePassword(event.target.value);
+                  setIncidentDeleteError("");
+                }}
+                className="w-full rounded-2xl border border-white/10 bg-[#08101d] px-4 py-3 text-sm text-white outline-none transition focus:border-red-400/60"
+                placeholder="Mot de passe requis"
+              />
+            </label>
+
+            {incidentDeleteError ? (
+              <div className="rounded-2xl border border-red-500/25 bg-red-500/10 px-4 py-3 text-sm text-red-100">
+                {incidentDeleteError}
+              </div>
+            ) : null}
+
+            <div className="flex flex-wrap gap-3">
+              <BoardDangerButton
+                onClick={() => void confirmDeleteIncident()}
+                disabled={isBusy || !incidentDeletePassword}
+              >
+                {isBusy ? "Suppression..." : "Confirmer la suppression"}
+              </BoardDangerButton>
+              <BoardGhostButton onClick={closeDeleteIncidentDialog}>Annuler</BoardGhostButton>
             </div>
           </div>
         </ModalShell>
@@ -3448,6 +3600,27 @@ function BoardButton({
       onClick={onClick}
       disabled={disabled}
       className="rounded-full bg-sky-400 px-4 py-2.5 text-sm font-semibold text-slate-950 transition hover:bg-sky-300 disabled:cursor-not-allowed disabled:opacity-60"
+    >
+      {children}
+    </button>
+  );
+}
+
+function BoardDangerButton({
+  children,
+  onClick,
+  disabled = false,
+}: {
+  children: ReactNode;
+  onClick?: () => void;
+  disabled?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      className="rounded-full border border-red-400/30 bg-red-400/10 px-4 py-2.5 text-sm font-semibold text-red-100 transition hover:bg-red-400/20 disabled:cursor-not-allowed disabled:opacity-60"
     >
       {children}
     </button>

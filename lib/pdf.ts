@@ -85,7 +85,7 @@ function addInfoGrid(
   entries: Array<{ label: string; value: string }>,
   startY: number
 ) {
-  let y = startY;
+  const y = startY;
   entries.forEach((entry, index) => {
     const column = index % 2;
     const row = Math.floor(index / 2);

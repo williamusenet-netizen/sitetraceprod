@@ -8,7 +8,6 @@ import {
   getUserFacingSupabaseErrorMessage,
   normalizeSupabaseError,
 } from "@/lib/supabase";
-import { buildIncidentClientMailText, generateIncidentClientPdf } from "@/lib/incident-pdf";
 
 type Project = {
   id: string;
@@ -144,8 +143,8 @@ async function convertHeicIfNeeded(file: File): Promise<File> {
     return file;
   }
 
-  const module = await import("heic2any");
-  const heic2any = module.default;
+  const heicModule = await import("heic2any");
+  const heic2any = heicModule.default;
   const converted = await heic2any({
     blob: file,
     toType: "image/jpeg",
@@ -547,7 +546,12 @@ export default function IncidentPage({
                       <span>Retour projet</span>
                     </Link>
                     <button
-                      onClick={() => generateIncidentClientPdf(project, incident)}
+                      onClick={() =>
+                        void (async () => {
+                          const { generateIncidentClientPdf } = await import("@/lib/incident-pdf");
+                          await generateIncidentClientPdf(project, incident);
+                        })()
+                      }
                       className="rounded-xl bg-white px-4 py-2 text-sm font-semibold text-slate-900"
                     >
                       Générer le PDF
@@ -602,6 +606,7 @@ export default function IncidentPage({
                   title="Copier le résumé client"
                   body="Préparer un message d'envoi directement exploitable."
                   onClick={async () => {
+                    const { buildIncidentClientMailText } = await import("@/lib/incident-pdf");
                     await navigator.clipboard.writeText(buildIncidentClientMailText(project, incident));
                     setSuccessMsg("Le résumé client a été copié dans le presse-papiers.");
                   }}
@@ -1032,13 +1037,19 @@ export default function IncidentPage({
 
               <div className="mt-5 grid gap-3 md:grid-cols-2">
                 <button
-                  onClick={() => generateIncidentClientPdf(project, incident)}
+                  onClick={() =>
+                    void (async () => {
+                      const { generateIncidentClientPdf } = await import("@/lib/incident-pdf");
+                      await generateIncidentClientPdf(project, incident);
+                    })()
+                  }
                   className="rounded-2xl bg-slate-900 px-5 py-3 text-sm font-semibold text-white"
                 >
                   Générer le PDF client
                 </button>
                 <button
                   onClick={async () => {
+                    const { buildIncidentClientMailText } = await import("@/lib/incident-pdf");
                     await navigator.clipboard.writeText(buildIncidentClientMailText(project, incident));
                     setSuccessMsg("Le texte client a été copié dans le presse-papiers.");
                   }}

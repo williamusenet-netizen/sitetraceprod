@@ -8,8 +8,6 @@ import {
   getUserFacingSupabaseErrorMessage,
   normalizeSupabaseError,
 } from "@/lib/supabase";
-import { buildIncidentClientMailText, generateIncidentClientPdf } from "@/lib/incident-pdf";
-import { generateProjectReportPdf } from "@/lib/pdf";
 
 type Project = {
   id: string;
@@ -154,8 +152,8 @@ async function convertHeicIfNeeded(file: File): Promise<File> {
     return file;
   }
 
-  const module = await import("heic2any");
-  const heic2any = module.default;
+  const heicModule = await import("heic2any");
+  const heic2any = heicModule.default;
   const converted = await heic2any({
     blob: file,
     toType: "image/jpeg",
@@ -590,7 +588,12 @@ export default function ProjectPage({
                 <QuickActionButton
                   title="Générer le rapport"
                   body="Produire une synthèse projet complète pour reporting."
-                  onClick={() => generateProjectReportPdf(project, sortedIncidents)}
+                  onClick={() =>
+                    void (async () => {
+                      const { generateProjectReportPdf } = await import("@/lib/pdf");
+                      await generateProjectReportPdf(project, sortedIncidents);
+                    })()
+                  }
                 />
               </div>
 
@@ -816,13 +819,19 @@ export default function ProjectPage({
 
                       <div className="flex flex-wrap gap-2">
                         <button
-                          onClick={() => generateIncidentClientPdf(project, incident)}
+                          onClick={() =>
+                            void (async () => {
+                              const { generateIncidentClientPdf } = await import("@/lib/incident-pdf");
+                              await generateIncidentClientPdf(project, incident);
+                            })()
+                          }
                           className="rounded-xl bg-slate-900 px-4 py-2 text-sm text-white"
                         >
                           Générer le PDF
                         </button>
                         <button
                           onClick={async () => {
+                            const { buildIncidentClientMailText } = await import("@/lib/incident-pdf");
                             const text = buildIncidentClientMailText(project, incident);
                             await navigator.clipboard.writeText(text);
                             setSuccessMsg("Texte de livrable copié dans le presse-papiers.");
