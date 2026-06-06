@@ -1,13 +1,44 @@
 ﻿"use client";
 
 import type { ReactNode } from "react";
+import Image from "next/image";
 import Link from "next/link";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   getSupabaseBrowserClient,
   getUserFacingSupabaseErrorMessage,
   normalizeSupabaseError,
 } from "@/lib/supabase";
+import {
+  buildAssignmentEmailBody,
+  buildAssignmentSmsBody,
+  buildAssignmentSubject,
+  buildMailtoLink,
+  buildSmsLink,
+  type AssignmentMessageTarget,
+} from "@/lib/assignment-messages";
+import { withTimeout } from "@/lib/async-timeout";
+import { copyTextToClipboard } from "@/lib/clipboard";
+import {
+  fetchProjectIncidentEvents,
+  fetchRecentIncidentEvents,
+  getIncidentEventWriteFeedbackMessage,
+  getIncidentEventsUnavailableDetail,
+  getIncidentEventsUnavailableMessage,
+  formatIncidentEventDate,
+  groupIncidentEventsByIncident,
+  logIncidentEvent,
+  type IncidentEvent,
+  type IncidentEventsUnavailableReason,
+} from "@/lib/incident-events";
+import {
+  DEFAULT_FIELDTRACE_USER_ID,
+  FIELDTRACE_USER_STORAGE_KEY,
+  FIELDTRACE_USERS,
+  getFieldTraceUser,
+} from "@/lib/fieldtrace-users";
+import { formatIncidentReference } from "@/lib/incident-reference";
+import { labelIncidentEventAction, labelIncidentEventSource } from "@/lib/incident-event-labels";
 import demoOperators from "@/data/fieldtrace-demo-operators.json";
 
 type DashboardStatus = "loading" | "ready" | "config-error" | "backend-unavailable";
@@ -17,6 +48,7 @@ type BossView =
   | "incidents"
   | "operators"
   | "performance"
+  | "journal"
   | "review";
 type AssignmentChannel = "email" | "sms";
 type InsightKey =
@@ -71,8 +103,11 @@ type Incident = {
   status?: string | null;
   reporter_name?: string | null;
   assignee?: string | null;
+  location?: string | null;
   initial_photo_url?: string | null;
   close_comment?: string | null;
+  close_photo_url?: string | null;
+  closed_by_name?: string | null;
   created_at?: string | null;
   updated_at?: string | null;
   closed_at?: string | null;
@@ -179,7 +214,20 @@ function projectLabel(project?: Project | null) {
 }
 
 function incidentRef(id: string) {
-  return `FT-${id.slice(0, 8).toUpperCase()}`;
+  return formatIncidentReference(id);
+}
+
+function incidentEventMetadataText(event: IncidentEvent, key: string) {
+  const value = event.metadata?.[key];
+  return typeof value === "string" && value.trim() ? value.trim() : "";
+}
+
+function auditIncidentLabel(event: IncidentEvent, incident?: IncidentRecord | null) {
+  return incident?.title || incidentEventMetadataText(event, "title") || incidentRef(event.incident_id);
+}
+
+function auditProjectLabel(event: IncidentEvent, project?: Project | null) {
+  return project?.displayName || incidentEventMetadataText(event, "project") || "Projet non relié";
 }
 
 function operatorLabel(operator: Operator) {
@@ -374,53 +422,25 @@ function normalizePhoneNumber(phone: string) {
   return hasPlusPrefix ? `+${digitsOnly}` : digitsOnly;
 }
 
-function buildAssignmentEmailSubject(incident: IncidentRecord) {
-  return `Assignation incident ${incidentRef(incident.id)} - ${incident.title}`;
-}
-
 function buildIncidentOperationUrl(appOrigin: string, incident: IncidentRecord) {
   const incidentPath = `/operation/${incident.id}`;
   return appOrigin ? `${appOrigin}${incidentPath}` : incidentPath;
 }
 
-function buildAssignmentEmailBody(incident: IncidentRecord, operator: Operator, appOrigin: string) {
-  const incidentUrl = buildIncidentOperationUrl(appOrigin, incident);
-
-  return [
-    `Bonjour ${operator.firstName},`,
-    "",
-    `Vous êtes assigné à l'incident N°${incidentRef(incident.id)}.`,
-    `Titre : ${incident.title}`,
-    `Emplacement : ${projectLabel(incident.project)}`,
-    `Criticité : ${priorityLabel(incident.priority)}`,
-    `Statut : ${statusLabel(incident.status)}`,
-    "",
-    `Accéder au problème : ${incidentUrl}`,
-    "",
-    "Merci de prendre en charge ce point.",
-  ].join("\n");
+function buildAssignmentTarget(incident: IncidentRecord): AssignmentMessageTarget {
+  return {
+    id: incident.id,
+    title: incident.title,
+    locationLabel: projectLabel(incident.project),
+    priorityLabel: priorityLabel(incident.priority),
+    statusLabel: statusLabel(incident.status),
+  };
 }
 
-function buildAssignmentSmsBody(incident: IncidentRecord, operator: Operator, appOrigin: string) {
-  const incidentUrl = buildIncidentOperationUrl(appOrigin, incident);
-
-  return [
-    `Bonjour ${operator.firstName},`,
-    `incident ${incidentRef(incident.id)} assigné.`,
-    `${incident.title}`,
-    `${projectLabel(incident.project)}`,
-    `${priorityLabel(incident.priority)} / ${statusLabel(incident.status)}`,
-    `Accéder : ${incidentUrl}`,
-    "Merci de prendre en charge ce point.",
-  ].join(" ");
-}
-
-function buildMailtoLink(email: string, subject: string, body: string) {
-  return `mailto:${email}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
-}
-
-function buildSmsLink(phone: string, body: string) {
-  return `sms:${phone}?body=${encodeURIComponent(body)}`;
+function csvCell(value?: string | number | null) {
+  const normalized = value === undefined || value === null ? "" : String(value);
+  const safeValue = /^\s*[=+\-@]/.test(normalized) ? `'${normalized}` : normalized;
+  return `"${safeValue.replace(/"/g, '""')}"`;
 }
 
 export function BossWorkbench() {
@@ -433,6 +453,7 @@ export function BossWorkbench() {
   const [errorMsg, setErrorMsg] = useState("");
   const [successMsg, setSuccessMsg] = useState("");
   const [isBusy, setIsBusy] = useState(false);
+  const [exportingProjectReportId, setExportingProjectReportId] = useState<string | null>(null);
 
   const [name, setName] = useState("");
   const [clientName, setClientName] = useState("");
@@ -454,6 +475,7 @@ export function BossWorkbench() {
   } | null>(null);
   const [pendingDeleteIncidentId, setPendingDeleteIncidentId] = useState<string | null>(null);
   const [incidentDeletePassword, setIncidentDeletePassword] = useState("");
+  const [incidentDeleteReference, setIncidentDeleteReference] = useState("");
   const [incidentDeleteError, setIncidentDeleteError] = useState("");
   const [operatorFirstName, setOperatorFirstName] = useState("");
   const [operatorLastName, setOperatorLastName] = useState("");
@@ -462,16 +484,66 @@ export function BossWorkbench() {
   const [operatorPhone, setOperatorPhone] = useState("");
   const [editingOperatorId, setEditingOperatorId] = useState<string | null>(null);
   const [pendingDeleteOperatorId, setPendingDeleteOperatorId] = useState<string | null>(null);
+  const [currentUserId, setCurrentUserId] = useState(DEFAULT_FIELDTRACE_USER_ID);
+  const [auditEvents, setAuditEvents] = useState<IncidentEvent[]>([]);
+  const [auditEventsAvailable, setAuditEventsAvailable] = useState(true);
+  const [auditEventsUnavailableReason, setAuditEventsUnavailableReason] =
+    useState<IncidentEventsUnavailableReason>(null);
+  const [isRefreshingAuditEvents, setIsRefreshingAuditEvents] = useState(false);
+  const [auditLastCheckedAt, setAuditLastCheckedAt] = useState<string | null>(null);
+  const [auditProjectFilter, setAuditProjectFilter] = useState("all");
+  const [auditActionFilter, setAuditActionFilter] = useState("all");
+  const [auditSourceFilter, setAuditSourceFilter] = useState("all");
+  const [auditPeriodFilter, setAuditPeriodFilter] = useState<"all" | "today" | "7d" | "30d">("30d");
+  const [auditActorFilter, setAuditActorFilter] = useState("all");
+  const [auditSearch, setAuditSearch] = useState("");
   const selectedIncidentPanelRef = useRef<HTMLDivElement | null>(null);
 
-  const loadOperators = async () => {
+  const currentUser = useMemo(() => getFieldTraceUser(currentUserId), [currentUserId]);
+
+  const refreshAuditEvents = useCallback(async () => {
+    setIsRefreshingAuditEvents(true);
+
+    try {
+      const result = await fetchRecentIncidentEvents(120);
+      setAuditEvents(result.events);
+      setAuditEventsAvailable(result.available);
+      setAuditEventsUnavailableReason(result.reason);
+      setAuditLastCheckedAt(new Date().toISOString());
+    } finally {
+      setIsRefreshingAuditEvents(false);
+    }
+  }, []);
+
+  const recordIncidentEvent = useCallback(async (
+    input: Omit<Parameters<typeof logIncidentEvent>[0], "actor_label" | "actor_role" | "source">
+  ) => {
+    const result = await logIncidentEvent({
+      ...input,
+      actor_label: currentUser.label,
+      actor_role: currentUser.role,
+      source: "boss",
+    });
+
+    if (!result.skipped) {
+      await refreshAuditEvents();
+    }
+
+    return result;
+  }, [currentUser.label, currentUser.role, refreshAuditEvents]);
+
+  const loadOperators = useCallback(async () => {
     try {
       const supabase = getSupabaseBrowserClient();
-      const { data, error } = await supabase
-        .from("operators")
-        .select(OPERATORS_TABLE_SELECT)
-        .order("last_name", { ascending: true })
-        .order("first_name", { ascending: true });
+      const { data, error } = await withTimeout(
+        supabase
+          .from("operators")
+          .select(OPERATORS_TABLE_SELECT)
+          .order("last_name", { ascending: true })
+          .order("first_name", { ascending: true }),
+        10000,
+        "Timeout chargement operateurs /boss."
+      );
 
       if (error) {
         if (isOperatorsTableMissingError(error)) {
@@ -494,21 +566,29 @@ export function BossWorkbench() {
         const bootstrapOperators = localOperators.length > 0 ? localOperators : DEMO_OPERATOR_SEED;
 
         if (bootstrapOperators.length > 0) {
-          const bootstrapResult = await supabase
-            .from("operators")
-            .insert(bootstrapOperators.map(mapOperatorToInsertPayload))
-            .select(OPERATORS_TABLE_SELECT);
+          const bootstrapResult = await withTimeout(
+            supabase
+              .from("operators")
+              .insert(bootstrapOperators.map(mapOperatorToInsertPayload))
+              .select(OPERATORS_TABLE_SELECT),
+            10000,
+            "Timeout initialisation operateurs /boss."
+          );
 
           if (!bootstrapResult.error) {
             remoteOperators = dedupeOperators(
               ((bootstrapResult.data || []) as RawOperator[]).map(mapRawOperator)
             );
           } else {
-            const reloadResult = await supabase
-              .from("operators")
-              .select(OPERATORS_TABLE_SELECT)
-              .order("last_name", { ascending: true })
-              .order("first_name", { ascending: true });
+            const reloadResult = await withTimeout(
+              supabase
+                .from("operators")
+                .select(OPERATORS_TABLE_SELECT)
+                .order("last_name", { ascending: true })
+                .order("first_name", { ascending: true }),
+              10000,
+              "Timeout rechargement operateurs /boss."
+            );
 
             if (!reloadResult.error) {
               remoteOperators = dedupeOperators(
@@ -524,10 +604,14 @@ export function BossWorkbench() {
         );
 
         if (missingLocalOperators.length > 0) {
-          const insertResult = await supabase
-            .from("operators")
-            .insert(missingLocalOperators.map(mapOperatorToInsertPayload))
-            .select(OPERATORS_TABLE_SELECT);
+          const insertResult = await withTimeout(
+            supabase
+              .from("operators")
+              .insert(missingLocalOperators.map(mapOperatorToInsertPayload))
+              .select(OPERATORS_TABLE_SELECT),
+            10000,
+            "Timeout synchronisation operateurs /boss."
+          );
 
           if (!insertResult.error) {
             remoteOperators = dedupeOperators([
@@ -535,11 +619,15 @@ export function BossWorkbench() {
               ...((insertResult.data || []) as RawOperator[]).map(mapRawOperator),
             ]);
           } else {
-            const reloadResult = await supabase
-              .from("operators")
-              .select(OPERATORS_TABLE_SELECT)
-              .order("last_name", { ascending: true })
-              .order("first_name", { ascending: true });
+            const reloadResult = await withTimeout(
+              supabase
+                .from("operators")
+                .select(OPERATORS_TABLE_SELECT)
+                .order("last_name", { ascending: true })
+                .order("first_name", { ascending: true }),
+              10000,
+              "Timeout rechargement operateurs /boss."
+            );
 
             if (!reloadResult.error) {
               remoteOperators = dedupeOperators(
@@ -562,26 +650,30 @@ export function BossWorkbench() {
       setOperators(nextOperators);
       setOperatorsMode("local-fallback");
     }
-  };
+  }, []);
 
-  const loadData = async () => {
+  const loadData = useCallback(async () => {
     setDashboardStatus("loading");
     setErrorMsg("");
 
     try {
       const supabase = getSupabaseBrowserClient();
-      const [projectResult, incidentResult] = await Promise.all([
-        supabase
-          .from("projects")
-          .select("id, name, site_name, client_name, location, status, created_at")
-          .order("created_at", { ascending: false }),
-        supabase
-          .from("incidents")
-          .select(
-            "id, project_id, title, description, category, priority, status, reporter_name, assignee, initial_photo_url, close_comment, created_at, updated_at, closed_at"
-          )
-          .order("created_at", { ascending: false }),
-      ]);
+      const [projectResult, incidentResult] = await withTimeout(
+        Promise.all([
+          supabase
+            .from("projects")
+            .select("id, name, site_name, client_name, location, status, created_at")
+            .order("created_at", { ascending: false }),
+          supabase
+            .from("incidents")
+            .select(
+              "id, project_id, title, description, category, priority, status, reporter_name, assignee, location, initial_photo_url, close_comment, close_photo_url, closed_by_name, created_at, updated_at, closed_at"
+            )
+            .order("created_at", { ascending: false }),
+        ]),
+        15000,
+        "Timeout chargement Supabase /boss."
+      );
 
       if (projectResult.error) throw projectResult.error;
       if (incidentResult.error) throw incidentResult.error;
@@ -598,6 +690,7 @@ export function BossWorkbench() {
       setProjects(mappedProjects);
       setIncidents((incidentResult.data || []) as Incident[]);
       setDashboardStatus("ready");
+      void refreshAuditEvents();
     } catch (error) {
       const normalizedError = normalizeSupabaseError(error);
       setErrorMsg(getUserFacingSupabaseErrorMessage(normalizedError.kind));
@@ -605,15 +698,28 @@ export function BossWorkbench() {
         normalizedError.kind === "config" ? "config-error" : "backend-unavailable"
       );
     }
-  };
+  }, [refreshAuditEvents]);
 
   useEffect(() => {
     void loadData();
-  }, []);
+  }, [loadData]);
 
   useEffect(() => {
     void loadOperators();
+  }, [loadOperators]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const storedUserId = window.localStorage.getItem(FIELDTRACE_USER_STORAGE_KEY);
+    if (storedUserId && FIELDTRACE_USERS.some((user) => user.id === storedUserId)) {
+      setCurrentUserId(storedUserId);
+    }
   }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem(FIELDTRACE_USER_STORAGE_KEY, currentUserId);
+  }, [currentUserId]);
 
   const records = useMemo(() => {
     const projectMap = new Map(projects.map((project) => [project.id, project]));
@@ -641,6 +747,148 @@ export function BossWorkbench() {
     () => records.find((incident) => incident.id === selectedIncidentId) || null,
     [records, selectedIncidentId]
   );
+
+  const auditRows = useMemo(
+    () =>
+      auditEvents.map((event) => {
+        const incident = records.find((item) => item.id === event.incident_id) || null;
+        const project = incident?.project || projects.find((item) => item.id === event.project_id) || null;
+
+        return {
+          event,
+          incident,
+          project,
+        };
+      }),
+    [auditEvents, projects, records]
+  );
+
+  const auditActionOptions = useMemo(
+    () => Array.from(new Set(auditEvents.map((event) => event.action))).sort(),
+    [auditEvents]
+  );
+
+  const auditSourceOptions = useMemo(
+    () =>
+      Array.from(new Set(auditEvents.map((event) => event.source).filter(Boolean) as string[])).sort(),
+    [auditEvents]
+  );
+
+  const auditActorOptions = useMemo(
+    () =>
+      Array.from(new Set(auditEvents.map((event) => event.actor_label).filter(Boolean) as string[])).sort(),
+    [auditEvents]
+  );
+
+  const auditActiveFilterCount = useMemo(
+    () =>
+      [
+        auditProjectFilter !== "all",
+        auditSourceFilter !== "all",
+        auditActionFilter !== "all",
+        auditPeriodFilter !== "30d",
+        auditActorFilter !== "all",
+        auditSearch.trim().length > 0,
+      ].filter(Boolean).length,
+    [auditActionFilter, auditActorFilter, auditPeriodFilter, auditProjectFilter, auditSearch, auditSourceFilter]
+  );
+
+  const filteredAuditRows = useMemo(() => {
+    const query = auditSearch.trim().toLowerCase();
+    const now = Date.now();
+    const startOfToday = new Date();
+    startOfToday.setHours(0, 0, 0, 0);
+
+    return auditRows.filter(({ event, incident, project }) => {
+      const matchesProject = auditProjectFilter === "all" || event.project_id === auditProjectFilter;
+      const matchesAction = auditActionFilter === "all" || event.action === auditActionFilter;
+      const matchesSource = auditSourceFilter === "all" || event.source === auditSourceFilter;
+      const matchesActor = auditActorFilter === "all" || event.actor_label === auditActorFilter;
+      const createdAt = event.created_at ? new Date(event.created_at).getTime() : 0;
+      const matchesPeriod =
+        auditPeriodFilter === "all" ||
+        (auditPeriodFilter === "today" && createdAt >= startOfToday.getTime()) ||
+        (auditPeriodFilter === "7d" && createdAt >= now - 7 * 24 * 60 * 60 * 1000) ||
+        (auditPeriodFilter === "30d" && createdAt >= now - 30 * 24 * 60 * 60 * 1000);
+      const reference = incidentRef(event.incident_id);
+      const searchableText = [
+        event.action,
+        labelIncidentEventAction(event.action),
+        reference,
+        event.summary,
+        event.actor_label,
+        event.actor_role,
+        labelIncidentEventSource(event.source),
+        auditIncidentLabel(event, incident),
+        auditProjectLabel(event, project),
+      ]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase();
+
+      return (
+        matchesProject &&
+        matchesAction &&
+        matchesSource &&
+        matchesActor &&
+        matchesPeriod &&
+        (!query || searchableText.includes(query))
+      );
+    });
+  }, [
+    auditActionFilter,
+    auditActorFilter,
+    auditPeriodFilter,
+    auditProjectFilter,
+    auditRows,
+    auditSearch,
+    auditSourceFilter,
+  ]);
+
+  const auditSummary = useMemo(() => {
+    const uniqueIncidents = new Set(filteredAuditRows.map(({ event }) => event.incident_id));
+
+    return {
+      total: filteredAuditRows.length,
+      incidents: uniqueIncidents.size,
+      terrain: filteredAuditRows.filter(({ event }) => event.source === "terrain").length,
+      bureau: filteredAuditRows.filter(({ event }) => event.source === "boss").length,
+      closures: filteredAuditRows.filter(({ event }) => event.action === "closed").length,
+      exports: filteredAuditRows.filter(({ event }) => event.action === "pdf_exported").length,
+    };
+  }, [filteredAuditRows]);
+
+  const auditFilterSummary = useMemo(() => {
+    const projectLabel =
+      auditProjectFilter === "all"
+        ? "Tous les projets"
+        : projects.find((project) => project.id === auditProjectFilter)?.displayName || "Projet filtré";
+    const periodLabel =
+      auditPeriodFilter === "today"
+        ? "Aujourd'hui"
+        : auditPeriodFilter === "7d"
+          ? "7 derniers jours"
+          : auditPeriodFilter === "30d"
+            ? "30 derniers jours"
+            : "Toute la période";
+
+    return [
+      `Projet: ${projectLabel}`,
+      `Source: ${auditSourceFilter === "all" ? "Toutes les sources" : labelIncidentEventSource(auditSourceFilter)}`,
+      `Action: ${auditActionFilter === "all" ? "Toutes les actions" : labelIncidentEventAction(auditActionFilter)}`,
+      `Période: ${periodLabel}`,
+      `Utilisateur: ${auditActorFilter === "all" ? "Tous les utilisateurs" : auditActorFilter}`,
+      `Recherche: ${auditSearch.trim() || "aucune"}`,
+    ].join(" | ");
+  }, [
+    auditActionFilter,
+    auditActorFilter,
+    auditPeriodFilter,
+    auditProjectFilter,
+    auditSearch,
+    auditSourceFilter,
+    projects,
+  ]);
 
   const selectedAssignmentIncident = useMemo(
     () => records.find((incident) => incident.id === assignmentDraft?.incidentId) || null,
@@ -1169,6 +1417,8 @@ export function BossWorkbench() {
     setErrorMsg("");
     setSuccessMsg("");
     setIsBusy(true);
+    const targetIncident = records.find((incident) => incident.id === incidentId) || null;
+    const previousStatus = targetIncident?.status || null;
 
     try {
       const supabase = getSupabaseBrowserClient();
@@ -1189,6 +1439,17 @@ export function BossWorkbench() {
       const { error } = await supabase.from("incidents").update(payload).eq("id", incidentId);
       if (error) throw error;
 
+      await recordIncidentEvent({
+        incident_id: incidentId,
+        project_id: targetIncident?.project_id || null,
+        action: previousStatus === "closed" && nextStatus !== "closed" ? "reopened" : nextStatus === "closed" ? "closed" : "status_changed",
+        summary: `Statut changé de ${statusLabel(previousStatus)} vers ${statusLabel(nextStatus)} depuis /boss.`,
+        metadata: {
+          previous_status: previousStatus,
+          next_status: nextStatus,
+        },
+      });
+
       setSuccessMsg(`Statut incident mis à jour en ${statusLabel(nextStatus)}.`);
       await loadData();
     } catch (error) {
@@ -1202,6 +1463,7 @@ export function BossWorkbench() {
   const openDeleteIncidentDialog = (incidentId: string) => {
     setPendingDeleteIncidentId(incidentId);
     setIncidentDeletePassword("");
+    setIncidentDeleteReference("");
     setIncidentDeleteError("");
     setErrorMsg("");
     setSuccessMsg("");
@@ -1211,6 +1473,7 @@ export function BossWorkbench() {
     if (isBusy) return;
     setPendingDeleteIncidentId(null);
     setIncidentDeletePassword("");
+    setIncidentDeleteReference("");
     setIncidentDeleteError("");
   };
 
@@ -1222,6 +1485,11 @@ export function BossWorkbench() {
 
     if (incidentDeletePassword !== INCIDENT_DELETE_PASSWORD) {
       setIncidentDeleteError("Mot de passe de suppression incorrect.");
+      return;
+    }
+
+    if (incidentDeleteReference.trim() !== incidentRef(pendingDeleteIncident.id)) {
+      setIncidentDeleteError(`Confirmez la référence ${incidentRef(pendingDeleteIncident.id)} avant suppression.`);
       return;
     }
 
@@ -1244,6 +1512,17 @@ export function BossWorkbench() {
         return;
       }
 
+      await recordIncidentEvent({
+        incident_id: pendingDeleteIncident.id,
+        project_id: pendingDeleteIncident.project_id,
+        action: "deleted",
+        summary: `Incident ${incidentRef(pendingDeleteIncident.id)} supprimé depuis /boss.`,
+        metadata: {
+          title: pendingDeleteIncident.title,
+          project: projectLabel(pendingDeleteIncident.project),
+        },
+      });
+
       setIncidents((current) =>
         current.filter((incident) => incident.id !== pendingDeleteIncident.id)
       );
@@ -1255,6 +1534,7 @@ export function BossWorkbench() {
       setActiveReviewActionKey(null);
       setPendingDeleteIncidentId(null);
       setIncidentDeletePassword("");
+      setIncidentDeleteReference("");
       setSuccessMsg(`Incident ${incidentRef(pendingDeleteIncident.id)} supprimé de la base.`);
       await loadData();
     } catch (error) {
@@ -1488,15 +1768,17 @@ export function BossWorkbench() {
     if (!assignmentDraft || !selectedAssignmentIncident || !selectedAssignmentOperator) return "";
 
     const appOrigin = typeof window !== "undefined" ? window.location.origin : "";
+    const assignmentTarget = buildAssignmentTarget(selectedAssignmentIncident);
+    const incidentUrl = buildIncidentOperationUrl(appOrigin, selectedAssignmentIncident);
 
     return assignmentDraft.channel === "sms"
-      ? buildAssignmentSmsBody(selectedAssignmentIncident, selectedAssignmentOperator, appOrigin)
-      : buildAssignmentEmailBody(selectedAssignmentIncident, selectedAssignmentOperator, appOrigin);
+      ? buildAssignmentSmsBody(assignmentTarget, selectedAssignmentOperator, incidentUrl)
+      : buildAssignmentEmailBody(assignmentTarget, selectedAssignmentOperator, incidentUrl);
   }, [assignmentDraft, selectedAssignmentIncident, selectedAssignmentOperator]);
 
   const assignmentEmailSubject = useMemo(() => {
     if (!selectedAssignmentIncident) return "";
-    return buildAssignmentEmailSubject(selectedAssignmentIncident);
+    return buildAssignmentSubject(buildAssignmentTarget(selectedAssignmentIncident));
   }, [selectedAssignmentIncident]);
 
   const canDeliverAssignment = useMemo(() => {
@@ -1528,6 +1810,21 @@ export function BossWorkbench() {
     setSelectedIncidentId(incident.id);
     setActiveReviewActionKey(null);
     setSuccessMsg(`Incident prioritaire chargé : ${incident.title}`);
+
+    if (typeof window !== "undefined") {
+      window.requestAnimationFrame(() => {
+        selectedIncidentPanelRef.current?.scrollIntoView({
+          behavior: "smooth",
+          block: "start",
+        });
+      });
+    }
+  };
+
+  const openIncidentFromJournal = (incident: IncidentRecord) => {
+    setSelectedIncidentId(incident.id);
+    setActiveView("incidents");
+    setSuccessMsg(`Incident chargé depuis le journal : ${incident.title}`);
 
     if (typeof window !== "undefined") {
       window.requestAnimationFrame(() => {
@@ -1635,8 +1932,20 @@ export function BossWorkbench() {
 
       if (error) throw error;
 
-      if (assignmentMessage && typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(assignmentMessage);
+      await recordIncidentEvent({
+        incident_id: assignmentDraft.incidentId,
+        project_id: selectedAssignmentIncident.project_id,
+        action: "assigned",
+        summary: `Incident assigné à ${operatorLabel(selectedAssignmentOperator)} depuis /boss.`,
+        metadata: {
+          previous_assignee: selectedAssignmentIncident.assignee || null,
+          assignee: operatorLabel(selectedAssignmentOperator),
+          channel: assignmentDraft.channel,
+        },
+      });
+
+      if (assignmentMessage) {
+        await copyTextToClipboard(assignmentMessage);
       }
 
       const deliveryLink =
@@ -1668,6 +1977,8 @@ export function BossWorkbench() {
   };
 
   const exportProjectReport = async (projectId: string) => {
+    if (exportingProjectReportId) return;
+
     const project = projects.find((item) => item.id === projectId);
     if (!project) {
       setErrorMsg("Emplacement introuvable pour le rapport.");
@@ -1676,9 +1987,13 @@ export function BossWorkbench() {
 
     setErrorMsg("");
     setSuccessMsg("");
+    setExportingProjectReportId(projectId);
 
     try {
       const { generateProjectReportPdf } = await import("@/lib/pdf");
+      const projectEventResult = await fetchProjectIncidentEvents(projectId, 300);
+      const sourceEvents = projectEventResult.available ? projectEventResult.events : auditEvents;
+      const projectEvents = groupIncidentEventsByIncident(sourceEvents, projectId);
 
       await generateProjectReportPdf(
         {
@@ -1699,18 +2014,142 @@ export function BossWorkbench() {
             priority: incident.priority,
             status: incident.status,
             reporter_name: incident.reporter_name,
-            location: incident.project?.location,
+            location: incident.location || incident.project?.location,
             initial_photo_url: incident.initial_photo_url,
             close_comment: incident.close_comment,
+            close_photo_url: incident.close_photo_url,
+            closed_by_name: incident.closed_by_name,
             created_at: incident.created_at,
             updated_at: incident.updated_at,
             closed_at: incident.closed_at,
-          }))
+          })),
+        projectEvents
       );
-      setSuccessMsg("Rapport PDF projet généré.");
+      const projectIncidentIds = records
+        .filter((incident) => incident.project_id === projectId)
+        .map((incident) => incident.id);
+
+      const auditAnchorIncidentId = projectIncidentIds[0] || null;
+      let auditEventRecorded = false;
+      let auditEventSkipped = false;
+      let auditEventReason: IncidentEventsUnavailableReason = null;
+      if (auditAnchorIncidentId) {
+        const auditResult = await recordIncidentEvent({
+          incident_id: auditAnchorIncidentId,
+          project_id: projectId,
+          action: "pdf_exported",
+          summary: `Rapport PDF projet généré pour ${project.displayName}.`,
+          metadata: {
+            project: project.displayName,
+            incident_count: projectIncidentIds.length,
+            scope: "project_report",
+          },
+        });
+        auditEventRecorded = auditResult.ok;
+        auditEventSkipped = auditResult.skipped;
+        auditEventReason = auditResult.reason;
+      }
+      setSuccessMsg(
+        getIncidentEventWriteFeedbackMessage({
+          baseMessage: "Rapport PDF projet généré",
+          recorded: auditEventRecorded,
+          skipped: auditEventSkipped,
+          reason: auditEventReason,
+          hasAnchorIncident: Boolean(auditAnchorIncidentId),
+        })
+      );
     } catch {
       setErrorMsg("Le rapport PDF n'a pas pu être généré.");
+    } finally {
+      setExportingProjectReportId(null);
     }
+  };
+
+  const exportAuditCsv = () => {
+    if (!auditEventsAvailable || filteredAuditRows.length === 0 || typeof window === "undefined") return;
+
+    const header = [
+      "Date",
+      "Action",
+      "Source",
+      "Utilisateur",
+      "Role",
+      "Projet",
+      "Reference incident",
+      "Incident",
+      "Resume",
+    ];
+    const rows = filteredAuditRows.map(({ event, incident, project }) => [
+      formatIncidentEventDate(event.created_at),
+      labelIncidentEventAction(event.action),
+      labelIncidentEventSource(event.source),
+      event.actor_label || "",
+      event.actor_role || "",
+      auditProjectLabel(event, project),
+      incidentRef(event.incident_id),
+      auditIncidentLabel(event, incident),
+      event.summary,
+    ]);
+    const csv = [header, ...rows].map((row) => row.map(csvCell).join(";")).join("\r\n");
+    const blob = new Blob([`\uFEFF${csv}`], { type: "text/csv;charset=utf-8" });
+    const url = window.URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `fieldtrace-journal-${new Date().toISOString().slice(0, 10)}.csv`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    window.URL.revokeObjectURL(url);
+    setSuccessMsg("Export CSV du journal généré.");
+  };
+
+  const copyAuditSummary = async () => {
+    if (!auditEventsAvailable || filteredAuditRows.length === 0) return;
+
+    const recentLines = filteredAuditRows.slice(0, 5).map(({ event, incident, project }) => {
+      const date = formatIncidentEventDate(event.created_at);
+      const action = labelIncidentEventAction(event.action);
+      const source = labelIncidentEventSource(event.source);
+      const actor = event.actor_label || "Utilisateur non renseigne";
+      const role = event.actor_role || "role non renseigne";
+      const reference = incidentRef(event.incident_id);
+      const incidentLabel = auditIncidentLabel(event, incident);
+      const projectLabel = auditProjectLabel(event, project);
+      return `- ${date} | ${action} | ${source} | ${actor} (${role}) | ${projectLabel} | ${reference} | ${incidentLabel} | ${event.summary}`;
+    });
+
+    const text = [
+      "Synthèse journal SiteTrace / FieldTrace",
+      `Dernière lecture: ${auditLastCheckedAt ? formatIncidentEventDate(auditLastCheckedAt) : "non effectuée"}`,
+      `Filtres: ${auditFilterSummary}`,
+      `Événements affichés: ${auditSummary.total}`,
+      `Incidents concernés: ${auditSummary.incidents}`,
+      `Actions terrain: ${auditSummary.terrain}`,
+      `Actions bureau: ${auditSummary.bureau}`,
+      `Clôtures: ${auditSummary.closures}`,
+      `Exports PDF: ${auditSummary.exports}`,
+      "",
+      "Dernières actions:",
+      recentLines.length > 0 ? recentLines.join("\n") : "- Aucune action affichée",
+    ].join("\n");
+
+    const copyResult = await copyTextToClipboard(text);
+    if (!copyResult.ok) {
+      setErrorMsg(copyResult.message);
+      return;
+    }
+
+    setErrorMsg("");
+    setSuccessMsg("Synthèse du journal copiée dans le presse-papiers.");
+  };
+
+  const resetAuditFilters = () => {
+    setAuditProjectFilter("all");
+    setAuditSourceFilter("all");
+    setAuditActionFilter("all");
+    setAuditPeriodFilter("30d");
+    setAuditActorFilter("all");
+    setAuditSearch("");
   };
 
   const viewTabs: Array<{ id: BossView; label: string; counter?: string }> = [
@@ -1719,6 +2158,7 @@ export function BossWorkbench() {
     { id: "incidents", label: "Incidents", counter: filteredIncidents.length.toString() },
     { id: "operators", label: "Opérateurs", counter: operators.length.toString() },
     { id: "performance", label: "Performance" },
+    { id: "journal", label: "Journal", counter: auditEventsAvailable ? auditEvents.length.toString() : "off" },
     { id: "review", label: "Revue direction" },
   ];
 
@@ -1765,7 +2205,16 @@ export function BossWorkbench() {
         <section className="rounded-[32px] border border-white/10 bg-[radial-gradient(circle_at_top_left,rgba(56,189,248,0.12),transparent_28%),linear-gradient(135deg,#0f172a_0%,#111827_55%,#151a27_100%)] p-5 shadow-[0_24px_80px_rgba(2,6,23,0.4)] sm:p-7">
           <div className="flex flex-col gap-6 xl:flex-row xl:items-start xl:justify-between">
             <div className="max-w-4xl">
-              <div className="flex flex-wrap gap-2">
+              <div className="flex flex-wrap items-center gap-3">
+                <div className="flex h-12 items-center rounded-2xl bg-white px-4 py-2 shadow-[0_12px_28px_rgba(2,6,23,0.18)]">
+                  <Image
+                    src="/brands/veolia-soredi.png"
+                    alt="Veolia"
+                    width={184}
+                    height={58}
+                    className="h-8 w-auto"
+                  />
+                </div>
                 <TagPill tone="sky">Field Trace Bureau</TagPill>
                 <TagPill tone="emerald">Pilotage opérationnel</TagPill>
               </div>
@@ -1783,6 +2232,22 @@ export function BossWorkbench() {
             </div>
 
             <div className="grid w-full max-w-xl grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
+              <div className="rounded-[24px] border border-white/10 bg-white/5 p-4 xl:col-span-4">
+                <label className="text-[11px] font-semibold uppercase tracking-[0.22em] text-slate-400">
+                  Utilisateur pilote
+                </label>
+                <select
+                  value={currentUserId}
+                  onChange={(event) => setCurrentUserId(event.target.value)}
+                  className="mt-2 w-full rounded-2xl border border-white/10 bg-[#08101d] px-3 py-3 text-sm font-semibold text-white outline-none"
+                >
+                  {FIELDTRACE_USERS.map((user) => (
+                    <option key={user.id} value={user.id}>
+                      {user.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
               <HeroMetric
                 eyebrow="Ouverts"
                 value={openActive.length}
@@ -1952,8 +2417,13 @@ export function BossWorkbench() {
                           </div>
 
                           <div className="mt-5 flex flex-wrap gap-3">
-                            <BoardButton onClick={() => void exportProjectReport(project.id)}>
-                              Generer rapport
+                            <BoardButton
+                              onClick={() => void exportProjectReport(project.id)}
+                              disabled={Boolean(exportingProjectReportId)}
+                            >
+                              {exportingProjectReportId === project.id
+                                ? "Generation..."
+                                : "Generer rapport"}
                             </BoardButton>
                             <Link
                               href={`/project/${project.id}`}
@@ -2145,9 +2615,11 @@ export function BossWorkbench() {
                                 }
                                 className="overflow-hidden rounded-2xl border border-white/10"
                               >
-                                <img
+                                <Image
                                   src={incidentPreviewUrl(incident) as string}
                                   alt={incident.title}
+                                  width={64}
+                                  height={64}
                                   className="h-16 w-16 object-cover"
                                 />
                               </button>
@@ -2458,6 +2930,226 @@ export function BossWorkbench() {
               </SectionShell>
             ) : null}
 
+            {activeView === "journal" ? (
+              <SectionShell
+                eyebrow="Journal d'audit"
+                title="Traçabilité des actions incident"
+                description="Vue manager des événements enregistrés pendant le pilote : création, statut, assignation, clôture, suppression et exports."
+              >
+                <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+                  <div className="grid gap-2 sm:grid-cols-2">
+                    <div className="rounded-2xl border border-white/10 bg-[#08101d] px-4 py-3 text-sm text-slate-300">
+                      {auditEventsAvailable
+                        ? `${filteredAuditRows.length} / ${auditEvents.length} événement(s) affiché(s).`
+                        : getIncidentEventsUnavailableMessage(auditEventsUnavailableReason)}
+                    </div>
+                    <div className="rounded-2xl border border-white/10 bg-[#08101d] px-4 py-3 text-sm text-slate-300">
+                      Dernière lecture :{" "}
+                      {auditLastCheckedAt ? formatIncidentEventDate(auditLastCheckedAt) : "non effectuée"}
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    {auditEventsAvailable ? (
+                      <BoardGhostButton onClick={resetAuditFilters} disabled={auditActiveFilterCount === 0}>
+                        {auditActiveFilterCount > 0
+                          ? `Réinitialiser filtres · ${auditActiveFilterCount}`
+                          : "Filtres au repos"}
+                      </BoardGhostButton>
+                    ) : null}
+                    <BoardButton
+                      onClick={() => void refreshAuditEvents()}
+                      disabled={isBusy || isRefreshingAuditEvents}
+                    >
+                      {isRefreshingAuditEvents ? "Actualisation..." : "Recharger le journal"}
+                    </BoardButton>
+                    <BoardButton
+                      onClick={exportAuditCsv}
+                      disabled={
+                        isBusy ||
+                        isRefreshingAuditEvents ||
+                        !auditEventsAvailable ||
+                        filteredAuditRows.length === 0
+                      }
+                    >
+                      Export CSV
+                    </BoardButton>
+                    <BoardButton
+                      onClick={() => void copyAuditSummary()}
+                      disabled={
+                        isBusy ||
+                        isRefreshingAuditEvents ||
+                        !auditEventsAvailable ||
+                        filteredAuditRows.length === 0
+                      }
+                    >
+                      Copier synthèse
+                    </BoardButton>
+                  </div>
+                </div>
+
+                {auditEventsAvailable ? (
+                  <>
+                    <div className="mb-5 grid gap-3 rounded-[28px] border border-white/10 bg-[#0b1220] p-4 lg:grid-cols-2 2xl:grid-cols-[1fr_1fr_1fr_1fr_1fr_1.4fr]">
+                      <label className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-400">
+                        Projet
+                        <select
+                          value={auditProjectFilter}
+                          onChange={(event) => setAuditProjectFilter(event.target.value)}
+                          className="mt-2 w-full rounded-2xl border border-white/10 bg-[#08101d] px-3 py-3 text-sm normal-case tracking-normal text-white outline-none"
+                        >
+                          <option value="all">Tous les projets</option>
+                          {projects.map((project) => (
+                            <option key={project.id} value={project.id}>
+                              {project.displayName}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <label className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-400">
+                        Source
+                        <select
+                          value={auditSourceFilter}
+                          onChange={(event) => setAuditSourceFilter(event.target.value)}
+                          className="mt-2 w-full rounded-2xl border border-white/10 bg-[#08101d] px-3 py-3 text-sm normal-case tracking-normal text-white outline-none"
+                        >
+                          <option value="all">Toutes les sources</option>
+                          {auditSourceOptions.map((source) => (
+                            <option key={source} value={source}>
+                              {labelIncidentEventSource(source)}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <label className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-400">
+                        Période
+                        <select
+                          value={auditPeriodFilter}
+                          onChange={(event) =>
+                            setAuditPeriodFilter(event.target.value as "all" | "today" | "7d" | "30d")
+                          }
+                          className="mt-2 w-full rounded-2xl border border-white/10 bg-[#08101d] px-3 py-3 text-sm normal-case tracking-normal text-white outline-none"
+                        >
+                          <option value="30d">30 derniers jours</option>
+                          <option value="7d">7 derniers jours</option>
+                          <option value="today">Aujourd'hui</option>
+                          <option value="all">Toute la période</option>
+                        </select>
+                      </label>
+                      <label className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-400">
+                        Action
+                        <select
+                          value={auditActionFilter}
+                          onChange={(event) => setAuditActionFilter(event.target.value)}
+                          className="mt-2 w-full rounded-2xl border border-white/10 bg-[#08101d] px-3 py-3 text-sm normal-case tracking-normal text-white outline-none"
+                        >
+                          <option value="all">Toutes les actions</option>
+                          {auditActionOptions.map((action) => (
+                            <option key={action} value={action}>
+                              {labelIncidentEventAction(action)}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <label className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-400">
+                        Utilisateur
+                        <select
+                          value={auditActorFilter}
+                          onChange={(event) => setAuditActorFilter(event.target.value)}
+                          className="mt-2 w-full rounded-2xl border border-white/10 bg-[#08101d] px-3 py-3 text-sm normal-case tracking-normal text-white outline-none"
+                        >
+                          <option value="all">Tous les utilisateurs</option>
+                          {auditActorOptions.map((actor) => (
+                            <option key={actor} value={actor}>
+                              {actor}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <label className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-400">
+                        Recherche
+                        <input
+                          value={auditSearch}
+                          onChange={(event) => setAuditSearch(event.target.value)}
+                          className="mt-2 w-full rounded-2xl border border-white/10 bg-[#08101d] px-3 py-3 text-sm normal-case tracking-normal text-white outline-none placeholder:text-slate-500"
+                          placeholder="Référence, incident, utilisateur"
+                        />
+                      </label>
+                    </div>
+
+                    <div className="mb-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-6">
+                      <MetricLine label="Événements" value={auditSummary.total.toString()} />
+                      <MetricLine label="Incidents" value={auditSummary.incidents.toString()} />
+                      <MetricLine label="Terrain" value={auditSummary.terrain.toString()} />
+                      <MetricLine label="Bureau" value={auditSummary.bureau.toString()} />
+                      <MetricLine label="Clôtures" value={auditSummary.closures.toString()} />
+                      <MetricLine label="Exports PDF" value={auditSummary.exports.toString()} />
+                    </div>
+                  </>
+                ) : null}
+
+                {!auditEventsAvailable ? (
+                  <div className="rounded-[28px] border border-amber-400/20 bg-amber-400/10 p-5 text-sm leading-7 text-amber-50">
+                    {getIncidentEventsUnavailableDetail(auditEventsUnavailableReason)}
+                  </div>
+                ) : auditRows.length === 0 ? (
+                  <div className="rounded-[28px] border border-dashed border-white/10 bg-[#0b1220] p-6 text-sm text-slate-400">
+                    Aucun événement enregistré pour le moment.
+                  </div>
+                ) : filteredAuditRows.length === 0 ? (
+                  <div className="rounded-[28px] border border-dashed border-white/10 bg-[#0b1220] p-6 text-sm text-slate-400">
+                    Aucun événement ne correspond aux filtres actifs.
+                  </div>
+                ) : (
+                  <div className="grid gap-3">
+                    {filteredAuditRows.map(({ event, incident, project }) => (
+                      <div
+                        key={event.id}
+                        className="grid gap-3 rounded-[24px] border border-white/10 bg-[#0b1220] p-4 xl:grid-cols-[1fr_1.2fr_0.8fr]"
+                      >
+                        <div>
+                          <p className="text-xs uppercase tracking-[0.22em] text-sky-300">
+                            {labelIncidentEventAction(event.action)}
+                          </p>
+                          <p className="mt-2 text-sm font-semibold text-white">
+                            {auditIncidentLabel(event, incident)}
+                          </p>
+                          <p className="mt-1 text-xs text-slate-400">
+                            {incidentRef(event.incident_id)} · {auditProjectLabel(event, project)}
+                          </p>
+                        </div>
+                        <div>
+                          <p className="text-sm leading-6 text-slate-200">{event.summary}</p>
+                          <p className="mt-2 text-xs text-slate-500">
+                            Source : {labelIncidentEventSource(event.source)}
+                          </p>
+                        </div>
+                        <div className="xl:text-right">
+                          <p className="text-sm text-slate-300">
+                            {event.actor_label || "Utilisateur non renseigné"}
+                          </p>
+                          <p className="mt-1 text-xs text-slate-500">
+                            {event.actor_role || "Role non renseigné"}
+                          </p>
+                          <p className="mt-1 text-xs text-slate-500">
+                            {formatIncidentEventDate(event.created_at)}
+                          </p>
+                          {incident ? (
+                            <button
+                              type="button"
+                              onClick={() => openIncidentFromJournal(incident)}
+                              className="mt-3 rounded-full border border-sky-400/30 bg-sky-400/10 px-3 py-1.5 text-xs text-sky-100 transition hover:bg-sky-400/20"
+                            >
+                              Ouvrir incident
+                            </button>
+                          ) : null}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </SectionShell>
+            ) : null}
+
             {activeView === "review" ? (
               <SectionShell
                 eyebrow="Revue de direction"
@@ -2702,9 +3394,11 @@ export function BossWorkbench() {
                         }
                         className="overflow-hidden rounded-2xl border border-white/10 bg-[#08101d] p-2"
                       >
-                        <img
+                        <Image
                           src={incidentPreviewUrl(selectedIncident) as string}
                           alt={selectedIncident.title}
+                          width={900}
+                          height={540}
                           className="max-h-64 w-full object-contain"
                         />
                       </button>
@@ -2714,6 +3408,12 @@ export function BossWorkbench() {
                     <DetailField label="Assigné à" value={selectedIncident.assignee || "Non assigné"} />
                     <DetailField label="Création" value={formatDate(selectedIncident.created_at)} />
                     <DetailField label="Dernière mise à jour" value={formatDate(selectedIncident.updated_at)} />
+                    {normalizeStatus(selectedIncident.status) === "closed" ? (
+                      <DetailField
+                        label="Clôturé par"
+                        value={selectedIncident.closed_by_name || "Non renseigné"}
+                      />
+                    ) : null}
                     <DetailField
                       label="Description"
                       value={selectedIncident.description || "Aucune description detaillee"}
@@ -2724,6 +3424,27 @@ export function BossWorkbench() {
                       value={selectedIncident.close_comment || "Pas de commentaire de cloture"}
                       multiline
                     />
+                    {selectedIncident.close_photo_url ? (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setSelectedImage({
+                            url: selectedIncident.close_photo_url as string,
+                            title: selectedIncident.title,
+                            subtitle: "Preuve de clôture",
+                          })
+                        }
+                        className="overflow-hidden rounded-2xl border border-white/10 bg-[#08101d] p-2"
+                      >
+                        <Image
+                          src={selectedIncident.close_photo_url}
+                          alt="Preuve de clôture"
+                          width={900}
+                          height={540}
+                          className="max-h-64 w-full object-contain"
+                        />
+                      </button>
+                    ) : null}
                   </div>
 
                   <div className="grid gap-3">
@@ -2850,9 +3571,11 @@ export function BossWorkbench() {
                               }
                               className="h-20 w-20 shrink-0 overflow-hidden rounded-2xl border border-white/10"
                             >
-                              <img
+                              <Image
                                 src={incidentPreviewUrl(incident) as string}
                                 alt={incident.title}
+                                width={80}
+                                height={80}
                                 className="h-full w-full object-cover"
                               />
                             </button>
@@ -3048,6 +3771,24 @@ export function BossWorkbench() {
               />
             </label>
 
+            <label className="block">
+              <span className="mb-2 block text-xs uppercase tracking-[0.24em] text-slate-400">
+                Référence à confirmer
+              </span>
+              <input
+                value={incidentDeleteReference}
+                onChange={(event) => {
+                  setIncidentDeleteReference(event.target.value);
+                  setIncidentDeleteError("");
+                }}
+                className="w-full rounded-2xl border border-white/10 bg-[#08101d] px-4 py-3 text-sm text-white outline-none transition focus:border-red-400/60"
+                placeholder={incidentRef(pendingDeleteIncident.id)}
+              />
+              <span className="mt-2 block text-xs leading-5 text-slate-400">
+                Tapez {incidentRef(pendingDeleteIncident.id)} pour confirmer que le bon incident est ciblé.
+              </span>
+            </label>
+
             {incidentDeleteError ? (
               <div className="rounded-2xl border border-red-500/25 bg-red-500/10 px-4 py-3 text-sm text-red-100">
                 {incidentDeleteError}
@@ -3057,7 +3798,11 @@ export function BossWorkbench() {
             <div className="flex flex-wrap gap-3">
               <BoardDangerButton
                 onClick={() => void confirmDeleteIncident()}
-                disabled={isBusy || !incidentDeletePassword}
+                disabled={
+                  isBusy ||
+                  !incidentDeletePassword ||
+                  incidentDeleteReference.trim() !== incidentRef(pendingDeleteIncident.id)
+                }
               >
                 {isBusy ? "Suppression..." : "Confirmer la suppression"}
               </BoardDangerButton>
@@ -3107,7 +3852,13 @@ export function BossWorkbench() {
           <div className="space-y-4">
             <p className="text-sm text-slate-300">{selectedImage.subtitle}</p>
             <div className="overflow-hidden rounded-[28px] border border-white/10 bg-[#08101d]">
-              <img src={selectedImage.url} alt={selectedImage.title} className="max-h-[72vh] w-full object-contain" />
+              <Image
+                src={selectedImage.url}
+                alt={selectedImage.title}
+                width={1200}
+                height={800}
+                className="max-h-[72vh] w-full object-contain"
+              />
             </div>
           </div>
         </ModalShell>
@@ -3368,9 +4119,11 @@ function IncidentLane({
                     }}
                     className="h-20 w-20 shrink-0 overflow-hidden rounded-2xl border border-white/10"
                   >
-                    <img
+                    <Image
                       src={incidentPreviewUrl(incident) as string}
                       alt={incident.title}
+                      width={80}
+                      height={80}
                       className="h-full w-full object-cover"
                     />
                   </button>
@@ -3410,7 +4163,7 @@ function IncidentLane({
                   <p className="mt-3 text-base font-semibold text-white">{incident.title}</p>
                   <p className="mt-2 text-sm text-slate-400">{projectLabel(incident.project)}</p>
                   <p className="mt-1 text-xs text-slate-500">
-                    {incidentNatureLabel(incident.category)} · {incident.assignee || "Non assigné"} · Âge {formatAgingHours(incident.updated_at || incident.created_at)}
+                    {incidentNatureLabel(incident.category)} · {incident.assignee || "Non assigné"} · Age {formatAgingHours(incident.updated_at || incident.created_at)}
                   </p>
                 </button>
               </div>
@@ -3630,15 +4383,18 @@ function BoardDangerButton({
 function BoardGhostButton({
   children,
   onClick,
+  disabled = false,
 }: {
   children: ReactNode;
   onClick?: () => void;
+  disabled?: boolean;
 }) {
   return (
     <button
       type="button"
       onClick={onClick}
-      className="rounded-full border border-white/10 px-4 py-2.5 text-sm text-slate-200 transition hover:border-white/20 hover:bg-white/5"
+      disabled={disabled}
+      className="rounded-full border border-white/10 px-4 py-2.5 text-sm text-slate-200 transition hover:border-white/20 hover:bg-white/5 disabled:cursor-not-allowed disabled:opacity-60"
     >
       {children}
     </button>

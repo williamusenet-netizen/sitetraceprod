@@ -1,13 +1,27 @@
 "use client";
 
-import React, { useEffect, useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import Image from "next/image";
 import Link from "next/link";
+import { withTimeout } from "@/lib/async-timeout";
+import { copyTextToClipboard } from "@/lib/clipboard";
 import {
   getSupabaseBrowserClient,
   getUserFacingSupabaseErrorMessage,
   normalizeSupabaseError,
 } from "@/lib/supabase";
+import {
+  fetchProjectIncidentEvents,
+  getIncidentEventWriteFeedbackMessage,
+  groupIncidentEventsByIncident,
+  logIncidentEvent,
+  type IncidentEventsUnavailableReason,
+} from "@/lib/incident-events";
+import {
+  DEFAULT_FIELDTRACE_USER_ID,
+  FIELDTRACE_USER_STORAGE_KEY,
+  getFieldTraceUser,
+} from "@/lib/fieldtrace-users";
 
 type Project = {
   id: string;
@@ -196,6 +210,7 @@ export default function ProjectPage({
   const [closePhotoFile, setClosePhotoFile] = useState<File | null>(null);
   const [statusFilter, setStatusFilter] = useState<"all" | IncidentStatus>("all");
   const [priorityFilter, setPriorityFilter] = useState<"all" | IncidentPriority>("all");
+  const [isExportingReport, setIsExportingReport] = useState(false);
 
   const resetClosureForm = () => {
     setClosingIncidentId(null);
@@ -211,7 +226,7 @@ export default function ProjectPage({
     setClosePhotoFile(null);
   };
 
-  const load = async ({ preserveReadyState = false }: { preserveReadyState?: boolean } = {}) => {
+  const load = useCallback(async ({ preserveReadyState = false }: { preserveReadyState?: boolean } = {}) => {
     if (!preserveReadyState) {
       setPageStatus("loading");
     }
@@ -219,11 +234,15 @@ export default function ProjectPage({
 
     try {
       const supabase = getSupabaseBrowserClient();
-      const { data: projectData, error: projectError } = await supabase
-        .from("projects")
-        .select("*")
-        .eq("id", id)
-        .maybeSingle();
+      const { data: projectData, error: projectError } = await withTimeout(
+        supabase
+          .from("projects")
+          .select("*")
+          .eq("id", id)
+          .maybeSingle(),
+        15000,
+        "Timeout chargement Supabase projet."
+      );
 
       if (projectError) throw projectError;
 
@@ -234,11 +253,15 @@ export default function ProjectPage({
         return;
       }
 
-      const { data: incidentData, error: incidentError } = await supabase
-        .from("incidents")
-        .select("*")
-        .eq("project_id", id)
-        .order("created_at", { ascending: false });
+      const { data: incidentData, error: incidentError } = await withTimeout(
+        supabase
+          .from("incidents")
+          .select("*")
+          .eq("project_id", id)
+          .order("created_at", { ascending: false }),
+        15000,
+        "Timeout chargement Supabase incidents projet."
+      );
 
       if (incidentError) throw incidentError;
 
@@ -253,13 +276,13 @@ export default function ProjectPage({
       setPageStatus(normalizedError.kind === "config" ? "config-error" : "backend-unavailable");
       setErrorMsg(getUserFacingSupabaseErrorMessage(normalizedError.kind));
     }
-  };
+  }, [id]);
 
   useEffect(() => {
     if (id) {
       load();
     }
-  }, [id]);
+  }, [id, load]);
 
   const createIncident = async () => {
     setErrorMsg("");
@@ -437,6 +460,66 @@ export default function ProjectPage({
   const allClosed = incidents.length > 0 && activeIncidents.length === 0;
   const noCritical = incidents.length > 0 && criticalIncidents.length === 0;
 
+  const exportProjectReport = async () => {
+    if (isExportingReport) return;
+
+    setErrorMsg("");
+    setSuccessMsg("");
+    setIsExportingReport(true);
+
+    try {
+      const { generateProjectReportPdf } = await import("@/lib/pdf");
+      const projectEventResult = await fetchProjectIncidentEvents(project.id, 300);
+      const eventsByIncident = projectEventResult.available
+        ? groupIncidentEventsByIncident(projectEventResult.events, project.id)
+        : {};
+
+      await generateProjectReportPdf(project, sortedIncidents, eventsByIncident);
+      const auditAnchorIncidentId = sortedIncidents[0]?.id || null;
+      let auditEventRecorded = false;
+      let auditEventReason: IncidentEventsUnavailableReason = projectEventResult.reason;
+      if (projectEventResult.available && auditAnchorIncidentId) {
+        const storedUserId =
+          typeof window !== "undefined"
+            ? window.localStorage.getItem(FIELDTRACE_USER_STORAGE_KEY)
+            : null;
+        const currentUser = getFieldTraceUser(storedUserId || DEFAULT_FIELDTRACE_USER_ID);
+
+        const auditResult = await logIncidentEvent({
+          incident_id: auditAnchorIncidentId,
+          project_id: project.id,
+          action: "pdf_exported",
+          actor_label: currentUser.label,
+          actor_role: currentUser.role,
+          source: "project",
+          summary: `Rapport PDF projet généré depuis la page projet ${projectName}.`,
+          metadata: {
+            project: projectName,
+            incident_count: sortedIncidents.length,
+            scope: "project_report",
+          },
+        });
+        auditEventRecorded = auditResult.ok;
+        auditEventReason = auditResult.reason;
+      }
+      setSuccessMsg(
+        getIncidentEventWriteFeedbackMessage({
+          baseMessage: "Rapport projet généré",
+          recorded: auditEventRecorded,
+          reason: auditEventReason,
+          hasAnchorIncident: Boolean(auditAnchorIncidentId),
+          journalWasAvailable: projectEventResult.available,
+        })
+      );
+    } catch (error) {
+      const normalizedError = normalizeSupabaseError(error);
+      console.error("[FieldTrace][Project] Project report export failed", normalizedError);
+      setErrorMsg(getUserFacingSupabaseErrorMessage(normalizedError.kind));
+    } finally {
+      setIsExportingReport(false);
+    }
+  };
+
   return (
     <main className="min-h-screen bg-[linear-gradient(180deg,#e7edf3_0%,#f4f6f8_42%,#f5f1e8_100%)]">
       <div className="w-full px-5 py-6 md:px-8 md:py-8 xl:px-10 2xl:px-12">
@@ -586,14 +669,14 @@ export default function ProjectPage({
                   body="Accéder aux incidents clôturés et aux exports client."
                 />
                 <QuickActionButton
-                  title="Générer le rapport"
-                  body="Produire une synthèse projet complète pour reporting."
-                  onClick={() =>
-                    void (async () => {
-                      const { generateProjectReportPdf } = await import("@/lib/pdf");
-                      await generateProjectReportPdf(project, sortedIncidents);
-                    })()
+                  title={isExportingReport ? "Génération en cours" : "Générer le rapport"}
+                  body={
+                    isExportingReport
+                      ? "Lecture des données et préparation du PDF."
+                      : "Produire une synthèse projet complète pour reporting."
                   }
+                  onClick={() => void exportProjectReport()}
+                  disabled={isExportingReport}
                 />
               </div>
 
@@ -833,7 +916,12 @@ export default function ProjectPage({
                           onClick={async () => {
                             const { buildIncidentClientMailText } = await import("@/lib/incident-pdf");
                             const text = buildIncidentClientMailText(project, incident);
-                            await navigator.clipboard.writeText(text);
+                            const copyResult = await copyTextToClipboard(text);
+                            if (!copyResult.ok) {
+                              setErrorMsg(copyResult.message);
+                              return;
+                            }
+                            setErrorMsg("");
                             setSuccessMsg("Texte de livrable copié dans le presse-papiers.");
                           }}
                           className="rounded-xl bg-slate-200 px-4 py-2 text-sm text-slate-700"
@@ -907,16 +995,19 @@ function QuickActionButton({
   title,
   body,
   onClick,
+  disabled = false,
 }: {
   title: string;
   body: string;
   onClick: () => void | Promise<void>;
+  disabled?: boolean;
 }) {
   return (
     <button
       type="button"
       onClick={onClick}
-      className="rounded-2xl border border-slate-200 bg-slate-50 p-4 text-left transition hover:bg-slate-100"
+      disabled={disabled}
+      className="rounded-2xl border border-slate-200 bg-slate-50 p-4 text-left transition hover:bg-slate-100 disabled:cursor-wait disabled:opacity-70"
     >
       <p className="text-sm font-semibold text-slate-900">{title}</p>
       <p className="mt-1 text-sm leading-6 text-slate-600">{body}</p>
@@ -1010,9 +1101,11 @@ function IncidentCard({
           {incident.initial_photo_url ? (
             <div className="mt-4">
               <p className="mb-2 text-sm font-semibold text-slate-900">Photo initiale</p>
-              <img
+              <Image
                 src={incident.initial_photo_url}
                 alt="Photo initiale"
+                width={900}
+                height={540}
                 className="max-h-72 rounded-2xl border border-slate-200"
               />
             </div>
@@ -1108,8 +1201,10 @@ function IncidentCard({
           {incident.close_photo_url ? (
             <div className="mt-4">
               <p className="mb-2 font-semibold">Photo de clôture</p>
-              <img
+              <Image
                 src={incident.close_photo_url}
+                width={900}
+                height={540}
                 alt="Photo de clôture"
                 className="max-h-72 rounded-2xl border border-slate-200"
               />

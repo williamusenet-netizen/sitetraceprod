@@ -1,4 +1,6 @@
 import jsPDF from "jspdf";
+import { labelIncidentEventAction, labelIncidentEventSource } from "@/lib/incident-event-labels";
+import { formatIncidentReference } from "@/lib/incident-reference";
 
 type ProjectLike = {
   id: string;
@@ -26,6 +28,17 @@ type IncidentLike = {
   updated_at?: string | null;
   closed_at?: string | null;
 };
+
+type PdfIncidentEvent = {
+  action?: string | null;
+  actor_label?: string | null;
+  actor_role?: string | null;
+  source?: string | null;
+  summary?: string | null;
+  created_at?: string | null;
+};
+
+const VEOLIA_LOGO_PATH = "/brands/veolia-soredi.png";
 
 function projectName(project: ProjectLike) {
   return project.site_name || project.name || "Projet";
@@ -139,6 +152,17 @@ async function imageUrlToPngDataUrl(url: string): Promise<string | null> {
   }
 }
 
+async function addVeoliaBrandLogo(doc: jsPDF) {
+  const logoDataUrl = await imageUrlToPngDataUrl(VEOLIA_LOGO_PATH);
+  if (!logoDataUrl) return;
+
+  try {
+    doc.addImage(logoDataUrl, "PNG", 154, 8, 42, 12);
+  } catch {
+    // Keep the report readable if the client logo cannot be embedded.
+  }
+}
+
 function fitRect(width: number, height: number, maxWidth: number, maxHeight: number) {
   const ratio = Math.min(maxWidth / width, maxHeight / height, 1);
   return { width: width * ratio, height: height * ratio };
@@ -153,10 +177,14 @@ async function getImageDimensions(dataUrl: string): Promise<{ width: number; hei
   });
 }
 
-export async function generateIncidentClientPdf(project: ProjectLike, incident: IncidentLike) {
+export async function generateIncidentClientPdf(
+  project: ProjectLike,
+  incident: IncidentLike,
+  events: PdfIncidentEvent[] = []
+) {
   const doc = new jsPDF();
   const name = projectName(project);
-  const reference = `INC-${incident.id.slice(0, 8).toUpperCase()}`;
+  const reference = formatIncidentReference(incident.id);
   const summary = incident.description || `Incident "${incident.title}" remonte sur le projet ${name}.`;
   const actionCorrective =
     incident.close_comment || "Action corrective a confirmer lors de la cloture ou du retour terrain.";
@@ -166,6 +194,7 @@ export async function generateIncidentClientPdf(project: ProjectLike, incident: 
       : "Le point reste ouvert ou en traitement. Une validation client finale reste necessaire.";
 
   addHeader(doc, "Rapport incident", "Dossier incident structure pour transmission client");
+  await addVeoliaBrandLogo(doc);
 
   let y = 52;
   doc.setFont("helvetica", "normal");
@@ -253,6 +282,21 @@ ${incident.description || "Sans description detaillee"}`,
     }
   }
 
+  if (events.length > 0) {
+    y = ensurePageSpace(doc, y + 4, 44);
+    y = addSectionTitle(doc, "Journal de suivi", y + 8);
+    const lines = events.slice(0, 8).map((event) => {
+      const date = event.created_at ? formatDate(event.created_at) : "Date non renseignée";
+      const source = labelIncidentEventSource(event.source);
+      const actor = event.actor_label || "Utilisateur";
+      const role = event.actor_role ? ` (${event.actor_role})` : "";
+      return `${date} - ${source} - ${actor}${role} - ${
+        event.summary || labelIncidentEventAction(event.action)
+      }`;
+    });
+    y = addWrappedText(doc, lines.join("\n"), 14, y, 180);
+  }
+
   y = ensurePageSpace(doc, y + 4, 34);
   y = addSectionTitle(doc, "Actions correctives", y + 8);
   y = addWrappedText(doc, actionCorrective, 14, y, 180);
@@ -304,7 +348,7 @@ export function buildIncidentClientMailText(project: ProjectLike, incident: Inci
     `Projet : ${name}`,
     `Client : ${project.client_name || "Non renseigné"}`,
     `Localisation : ${project.location || "Non renseigné"}`,
-    `Reference : INC-${incident.id.slice(0, 8).toUpperCase()}`,
+    `Reference : ${formatIncidentReference(incident.id)}`,
     `Catégorie : ${incident.category || "Non renseigné"}`,
     `Priorité : ${incident.priority || "Non renseigné"}`,
     `Statut : ${incident.status || "open"}`,

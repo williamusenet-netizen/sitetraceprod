@@ -1,17 +1,18 @@
 # FieldTrace
 
-FieldTrace est une application web de pilotage terrain conçue pour suivre des incidents et des non-conformités, de la déclaration sur site jusqu'au livrable client.
+FieldTrace est une application web de pilotage terrain concue pour suivre des incidents et des non-conformites, de la declaration sur site jusqu'au livrable client.
 
-Le produit est structuré autour de deux usages complémentaires :
-- mode terrain : saisie rapide mobile-first pour signaler, suivre et clôturer
-- mode bureau : pilotage opérationnel, priorisation, assignation et revue
+Le produit est structure autour de deux usages complementaires :
 
-## Fonctionnalités principales
+- mode terrain : saisie rapide mobile-first pour signaler, suivre et cloturer
+- mode bureau : pilotage operationnel, priorisation, assignation et revue
 
-- création d'incidents et de non-conformités en mode terrain
-- suivi, changement de statut et clôture avec preuves photo
-- vue bureau `/boss` pour prioriser les points ouverts
-- assignation par mail ou SMS avec lien direct vers l'opération
+## Fonctionnalites principales
+
+- creation d'incidents et de non-conformites en mode terrain
+- suivi, changement de statut et cloture avec preuves photo
+- vue bureau `/boss` protegee par Basic Auth
+- assignation par mail ou SMS avec lien direct vers l'operation
 - export PDF projet et incident
 
 ## Stack
@@ -23,7 +24,7 @@ Le produit est structuré autour de deux usages complémentaires :
 
 ## Lancement local
 
-1. Installer les dépendances :
+1. Installer les dependances :
 
 ```bash
 npm install
@@ -34,9 +35,12 @@ npm install
 ```bash
 NEXT_PUBLIC_SUPABASE_URL=...
 NEXT_PUBLIC_SUPABASE_ANON_KEY=...
+FIELDTRACE_BOSS_PASSWORD=localtest
+# Optionnel, valeur par defaut: fieldtrace
+FIELDTRACE_BOSS_USER=fieldtrace
 ```
 
-3. Démarrer l'application :
+3. Demarrer l'application :
 
 ```bash
 npm run dev
@@ -45,7 +49,9 @@ npm run dev
 4. Ouvrir :
 
 - mode terrain : [http://localhost:3000](http://localhost:3000)
-- mode bureau : [http://localhost:3000/boss](http://localhost:3000/boss)
+- mode bureau : [http://fieldtrace:localtest@localhost:3000/boss](http://fieldtrace:localtest@localhost:3000/boss)
+
+Si `/boss` retourne `503`, verifier que `FIELDTRACE_BOSS_PASSWORD` est renseigne avant de redemarrer le serveur local.
 
 ## Build production
 
@@ -54,14 +60,19 @@ npm run build
 npm run start
 ```
 
-## Déploiement
+## Deploiement
 
-Le projet est prévu pour un déploiement sur Vercel avec les variables suivantes :
+Le projet est prevu pour un deploiement sur Vercel avec les variables suivantes :
 
 - `NEXT_PUBLIC_SUPABASE_URL`
 - `NEXT_PUBLIC_SUPABASE_ANON_KEY`
+- `FIELDTRACE_BOSS_PASSWORD`
+- `FIELDTRACE_BOSS_USER` si un identifiant different de `fieldtrace` est souhaite
 
-## Notes de démonstration
+Ne jamais stocker le mot de passe reel dans le depot.
 
-- la version actuelle est préparée pour une démonstration propre orientée métier
-- les outils QA internes et datasets de seed ne font pas partie du périmètre public de démonstration
+## Notes de demonstration
+
+- la version actuelle est preparee pour une demonstration propre orientee metier
+- les incidents existants du pilote Soredi sont des donnees reelles et ne doivent pas etre modifies pour tester
+- les outils QA internes et datasets de seed ne font pas partie du perimetre public de demonstration

@@ -1,5 +1,6 @@
 ﻿"use client";
 
+import Image from "next/image";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useEffect, useState } from "react";
@@ -143,12 +144,25 @@ export function AppStatusBar() {
         >
           <div className="flex items-center justify-between gap-3">
             <div className="min-w-0">
-              <Link
-                href="/"
-                className="text-[11px] uppercase tracking-[0.22em] text-sky-300 transition hover:text-sky-200"
-              >
-                FieldTrace
-              </Link>
+              <div className="flex items-center gap-3">
+                <Link
+                  href="/"
+                  className="text-[11px] uppercase tracking-[0.22em] text-sky-300 transition hover:text-sky-200"
+                >
+                  FieldTrace
+                </Link>
+                {!isOperationHeaderCollapsed ? (
+                  <div className="rounded-lg bg-white px-2 py-1">
+                    <Image
+                      src="/brands/veolia-soredi.png"
+                      alt="Veolia"
+                      width={92}
+                      height={29}
+                      className="h-4 w-auto"
+                    />
+                  </div>
+                ) : null}
+              </div>
               <div className="mt-1 flex items-center gap-2">
                 <p className="truncate text-sm font-semibold text-slate-50">Incident terrain</p>
                 <span className="rounded-full border border-white/10 bg-white/5 px-2 py-0.5 text-[10px] uppercase tracking-[0.18em] text-slate-300">
@@ -179,18 +193,29 @@ export function AppStatusBar() {
     <div className="sticky top-0 z-50 bg-[#0b1220]/92 px-3 py-4 shadow-[0_14px_40px_rgba(2,6,23,0.45)] backdrop-blur-xl sm:px-4 md:px-5 lg:px-6 xl:px-8">
       <div className="mx-auto w-full max-w-[2160px] rounded-[28px] border border-white/10 bg-[#111827]/92 px-5 py-4 shadow-[0_10px_30px_rgba(2,6,23,0.35)]">
         <div className="flex min-w-0 flex-col gap-4 xl:flex-row xl:items-center xl:justify-between">
-          <div className="min-w-0">
-            <Link
-              href="/"
-              className="text-xs uppercase tracking-[0.25em] text-sky-300 transition hover:text-sky-200"
-            >
-              SiteTrace Board V1
-            </Link>
-            <h1 className="mt-1 text-2xl font-bold text-slate-50">{mainTitle}</h1>
-            <div className="mt-2 flex flex-wrap gap-x-5 gap-y-1 text-sm text-slate-400">
-              <span>{pathname.startsWith("/boss") ? "Mode : bureau" : "Mode : terrain"}</span>
-              <span>{pathname.startsWith("/boss") ? "Usage : pilotage et portefeuille" : "Usage : incidents et preuves"}</span>
-              <span>{`Page : ${pageLabel}`}</span>
+          <div className="flex min-w-0 flex-col gap-4 sm:flex-row sm:items-center">
+            <div className="flex h-14 w-fit shrink-0 items-center rounded-2xl bg-white px-4 py-2">
+              <Image
+                src="/brands/veolia-soredi.png"
+                alt="Veolia"
+                width={184}
+                height={58}
+                className="h-8 w-auto"
+              />
+            </div>
+            <div className="min-w-0">
+              <Link
+                href="/"
+                className="text-xs uppercase tracking-[0.25em] text-sky-300 transition hover:text-sky-200"
+              >
+                SiteTrace Board V1
+              </Link>
+              <h1 className="mt-1 text-2xl font-bold text-slate-50">{mainTitle}</h1>
+              <div className="mt-2 flex flex-wrap gap-x-5 gap-y-1 text-sm text-slate-400">
+                <span>{pathname.startsWith("/boss") ? "Mode : bureau" : "Mode : terrain"}</span>
+                <span>{pathname.startsWith("/boss") ? "Usage : pilotage et portefeuille" : "Usage : incidents et preuves"}</span>
+                <span>{`Page : ${pageLabel}`}</span>
+              </div>
             </div>
           </div>
 

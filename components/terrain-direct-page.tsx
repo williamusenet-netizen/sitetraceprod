@@ -1,12 +1,38 @@
 ﻿"use client";
 
+import Image from "next/image";
 import type { ReactNode } from "react";
 import { useEffect, useMemo, useState } from "react";
+import { withTimeout } from "@/lib/async-timeout";
 import {
   getSupabaseBrowserClient,
   getUserFacingSupabaseErrorMessage,
   normalizeSupabaseError,
 } from "@/lib/supabase";
+import {
+  buildAssignmentEmailBody,
+  buildAssignmentSmsBody,
+  buildAssignmentSubject,
+  buildMailtoLink,
+  buildSmsLink,
+  type AssignmentMessageTarget,
+} from "@/lib/assignment-messages";
+import {
+  fetchIncidentEvents,
+  formatIncidentEventDate,
+  getIncidentEventsUnavailableMessage,
+  logIncidentEvent,
+  type IncidentEvent,
+  type IncidentEventsUnavailableReason,
+} from "@/lib/incident-events";
+import {
+  DEFAULT_FIELDTRACE_USER_ID,
+  FIELDTRACE_USER_STORAGE_KEY,
+  FIELDTRACE_USERS,
+  getFieldTraceUser,
+} from "@/lib/fieldtrace-users";
+import { formatIncidentReference } from "@/lib/incident-reference";
+import { labelIncidentEventAction, labelIncidentEventSource } from "@/lib/incident-event-labels";
 
 type Emplacement = {
   id: string;
@@ -180,7 +206,7 @@ function getOperationErrorMessage(error: unknown) {
 }
 
 function incidentReference(id: string) {
-  return `FT-${id.slice(0, 8).toUpperCase()}`;
+  return formatIncidentReference(id);
 }
 
 function normalizePriority(priority?: string | null): IncidentPriority {
@@ -226,46 +252,23 @@ function buildOperationUrl(incidentId: string) {
   return `${window.location.origin}${path}`;
 }
 
-function buildAssignmentEmailSubject(target: AssignmentTarget) {
-  return `Assignation incident ${incidentReference(target.id)} - ${target.title}`;
+function buildAssignmentTarget(target: AssignmentTarget): AssignmentMessageTarget {
+  return {
+    id: target.id,
+    title: target.title,
+    locationLabel: target.emplacementName,
+    priorityLabel: priorityLabel(target.priority),
+    statusLabel: statusLabel(target.status),
+  };
 }
 
 function buildAssignmentMessage(target: AssignmentTarget, operator: Operator, channel: AssignmentChannel) {
+  const assignmentTarget = buildAssignmentTarget(target);
   const incidentUrl = buildOperationUrl(target.id);
 
-  if (channel === "sms") {
-    return [
-      `Bonjour ${operator.firstName},`,
-      `incident ${incidentReference(target.id)} assigné.`,
-      target.title,
-      target.emplacementName,
-      `${priorityLabel(target.priority)} / ${statusLabel(target.status)}`,
-      `Accéder : ${incidentUrl}`,
-      "Merci de prendre en charge ce point.",
-    ].join(" ");
-  }
-
-  return [
-    `Bonjour ${operator.firstName},`,
-    "",
-    `Vous êtes assigné à l'incident N°${incidentReference(target.id)}.`,
-    `Titre : ${target.title}`,
-    `Emplacement : ${target.emplacementName}`,
-    `Criticité : ${priorityLabel(target.priority)}`,
-    `Statut : ${statusLabel(target.status)}`,
-    "",
-    `Accéder au problème : ${incidentUrl}`,
-    "",
-    "Merci de prendre en charge ce point.",
-  ].join("\n");
-}
-
-function buildMailtoLink(email: string, subject: string, body: string) {
-  return `mailto:${email}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
-}
-
-function buildSmsLink(phone: string, body: string) {
-  return `sms:${phone}?body=${encodeURIComponent(body)}`;
+  return channel === "sms"
+    ? buildAssignmentSmsBody(assignmentTarget, operator, incidentUrl)
+    : buildAssignmentEmailBody(assignmentTarget, operator, incidentUrl);
 }
 
 function formatDate(value?: string | null) {
@@ -431,6 +434,13 @@ export function TerrainDirectPage({
   const [closureError, setClosureError] = useState("");
   const [isBusy, setIsBusy] = useState(false);
   const [hasAppliedInitialIncident, setHasAppliedInitialIncident] = useState(false);
+  const [currentUserId, setCurrentUserId] = useState(DEFAULT_FIELDTRACE_USER_ID);
+  const [incidentEvents, setIncidentEvents] = useState<IncidentEvent[]>([]);
+  const [incidentEventsAvailable, setIncidentEventsAvailable] = useState(true);
+  const [incidentEventsUnavailableReason, setIncidentEventsUnavailableReason] =
+    useState<IncidentEventsUnavailableReason>(null);
+
+  const currentUser = useMemo(() => getFieldTraceUser(currentUserId), [currentUserId]);
 
   const loadData = async ({ quiet = false }: { quiet?: boolean } = {}) => {
     if (!quiet) {
@@ -439,19 +449,23 @@ export function TerrainDirectPage({
 
     try {
       const supabase = getSupabaseBrowserClient();
-      const [projectResult, incidentResult] = await Promise.all([
-        supabase
-          .from("projects")
-          .select("id, name, site_name, location, status, created_at")
-          .order("created_at", { ascending: false }),
-        supabase
-          .from("incidents")
-          .select(
-            "id, project_id, title, description, category, priority, status, assignee, initial_photo_url, close_comment, close_photo_url, closed_by_name, created_at, updated_at, closed_at"
-          )
-          .order("updated_at", { ascending: false, nullsFirst: false })
-          .order("created_at", { ascending: false }),
-      ]);
+      const [projectResult, incidentResult] = await withTimeout(
+        Promise.all([
+          supabase
+            .from("projects")
+            .select("id, name, site_name, location, status, created_at")
+            .order("created_at", { ascending: false }),
+          supabase
+            .from("incidents")
+            .select(
+              "id, project_id, title, description, category, priority, status, assignee, initial_photo_url, close_comment, close_photo_url, closed_by_name, created_at, updated_at, closed_at"
+            )
+            .order("updated_at", { ascending: false, nullsFirst: false })
+            .order("created_at", { ascending: false }),
+        ]),
+        15000,
+        "Timeout chargement Supabase terrain."
+      );
 
       if (projectResult.error) throw projectResult.error;
       if (incidentResult.error) throw incidentResult.error;
@@ -475,14 +489,31 @@ export function TerrainDirectPage({
     loadData();
   }, []);
 
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const storedUserId = window.localStorage.getItem(FIELDTRACE_USER_STORAGE_KEY);
+    if (storedUserId && FIELDTRACE_USERS.some((user) => user.id === storedUserId)) {
+      setCurrentUserId(storedUserId);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem(FIELDTRACE_USER_STORAGE_KEY, currentUserId);
+  }, [currentUserId]);
+
   const loadOperators = async () => {
     try {
       const supabase = getSupabaseBrowserClient();
-      const { data, error } = await supabase
-        .from("operators")
-        .select(OPERATORS_TABLE_SELECT)
-        .order("last_name", { ascending: true })
-        .order("first_name", { ascending: true });
+      const { data, error } = await withTimeout(
+        supabase
+          .from("operators")
+          .select(OPERATORS_TABLE_SELECT)
+          .order("last_name", { ascending: true })
+          .order("first_name", { ascending: true }),
+        10000,
+        "Timeout chargement operateurs terrain."
+      );
 
       if (error) {
         setOperators([]);
@@ -560,6 +591,13 @@ export function TerrainDirectPage({
     [assignmentOperatorId, operators]
   );
 
+  const refreshSelectedIncidentEvents = async (incidentId: string) => {
+    const result = await fetchIncidentEvents(incidentId, 12);
+    setIncidentEvents(result.events);
+    setIncidentEventsAvailable(result.available);
+    setIncidentEventsUnavailableReason(result.reason);
+  };
+
   const canDeliverAssignment = useMemo(() => {
     if (!assignmentTarget || !selectedAssignmentOperator) return false;
     if (assignmentChannel === "sms") {
@@ -603,7 +641,25 @@ export function TerrainDirectPage({
     setClosureComment(selectedIncident.close_comment || "");
     setClosurePhotoFile(null);
     setClosureError("");
+    void refreshSelectedIncidentEvents(selectedIncident.id);
   }, [selectedIncident]);
+
+  const recordIncidentEvent = async (
+    input: Omit<Parameters<typeof logIncidentEvent>[0], "actor_label" | "actor_role" | "source">
+  ) => {
+    const result = await logIncidentEvent({
+      ...input,
+      actor_label: currentUser.label,
+      actor_role: currentUser.role,
+      source: "terrain",
+    });
+
+    if (input.incident_id === selectedIncidentId) {
+      await refreshSelectedIncidentEvents(input.incident_id);
+    }
+
+    return result;
+  };
 
   const goHome = () => {
     setScreen("home");
@@ -744,22 +800,28 @@ export function TerrainDirectPage({
         payload.initial_photo_url = await uploadIncidentPhoto(draftPhotoFile, "initial");
       }
 
-      const { error } = await supabase.from("incidents").insert(payload);
+      const { data: createdData, error } = await supabase
+        .from("incidents")
+        .insert(payload)
+        .select("id, project_id, title, category, priority, status, assignee, created_at, updated_at")
+        .single();
       if (error) throw error;
 
-      let createdIncident: Incident | null = null;
-      if (selectedAssignee) {
-        const { data } = await supabase
-          .from("incidents")
-          .select("id, project_id, title, category, priority, status, assignee, created_at, updated_at")
-          .eq("project_id", selectedEmplacement.id)
-          .eq("title", draftTitle.trim())
-          .eq("assignee", operatorLabel(selectedAssignee))
-          .order("created_at", { ascending: false })
-          .limit(1)
-          .maybeSingle();
+      const createdIncident = (createdData as Incident | null) || null;
 
-        createdIncident = (data as Incident | null) || null;
+      if (createdIncident) {
+        await recordIncidentEvent({
+          incident_id: createdIncident.id,
+          project_id: selectedEmplacement.id,
+          action: "incident_created",
+          summary: `${entryKind === "incident" ? "Incident" : "Non-conformité"} créé depuis le terrain mobile.`,
+          metadata: {
+            title: createdIncident.title,
+            priority: createdIncident.priority || draftPriority,
+            assignee: createdIncident.assignee || null,
+            has_initial_photo: Boolean(draftPhotoFile),
+          },
+        });
       }
 
       await loadData({ quiet: true });
@@ -830,6 +892,19 @@ export function TerrainDirectPage({
       const { error } = await supabase.from("incidents").update(payload).eq("id", selectedIncident.id);
       if (error) throw error;
 
+      await recordIncidentEvent({
+        incident_id: selectedIncident.id,
+        project_id: selectedIncident.project_id,
+        action: followPhotoFile ? "photo_added" : "incident_updated",
+        summary: followPhotoFile
+          ? "Suivi terrain enregistré avec une photo."
+          : "Commentaire de suivi terrain ajouté.",
+        metadata: {
+          comment: followComment.trim() || null,
+          has_photo: Boolean(followPhotoFile),
+        },
+      });
+
       await loadData({ quiet: true });
       setFollowComment("");
       setFollowPhotoFile(null);
@@ -845,6 +920,8 @@ export function TerrainDirectPage({
   };
 
   const updateIncidentStatus = async (incidentId: string, nextStatus: IncidentStatus) => {
+    const targetIncident = incidents.find((incident) => incident.id === incidentId) || null;
+    const previousStatus = targetIncident?.status || null;
     setIsBusy(true);
     setMessage(null);
 
@@ -867,6 +944,17 @@ export function TerrainDirectPage({
         .eq("id", incidentId);
 
       if (error) throw error;
+
+      await recordIncidentEvent({
+        incident_id: incidentId,
+        project_id: targetIncident?.project_id || null,
+        action: previousStatus === "closed" && nextStatus !== "closed" ? "reopened" : "status_changed",
+        summary: `Statut changé de ${statusLabel(previousStatus)} vers ${statusLabel(nextStatus)}.`,
+        metadata: {
+          previous_status: previousStatus,
+          next_status: nextStatus,
+        },
+      });
 
       await loadData({ quiet: true });
       setMessage({ tone: "success", text: `Statut mis a jour en ${statusLabel(nextStatus)}.` });
@@ -926,6 +1014,18 @@ export function TerrainDirectPage({
 
       if (error) throw error;
 
+      await recordIncidentEvent({
+        incident_id: selectedIncident.id,
+        project_id: selectedIncident.project_id,
+        action: "assigned",
+        summary: `Incident assigné à ${assignee}.`,
+        metadata: {
+          previous_assignee: selectedIncident.assignee || null,
+          assignee,
+          channel: assignmentChannel,
+        },
+      });
+
       await loadData({ quiet: true });
       setShowAssignDialog(false);
       setAssignmentTarget({
@@ -977,6 +1077,19 @@ export function TerrainDirectPage({
       const { error } = await supabase.from("incidents").update(payload).eq("id", selectedIncident.id);
       if (error) throw error;
 
+      await recordIncidentEvent({
+        incident_id: selectedIncident.id,
+        project_id: selectedIncident.project_id,
+        action: "closed",
+        summary: `Incident clôturé par ${closureName.trim()}.`,
+        metadata: {
+          closed_by_name: closureName.trim(),
+          closed_at: new Date(closureDate).toISOString(),
+          close_comment: closureComment.trim(),
+          has_photo: Boolean(closurePhotoFile),
+        },
+      });
+
       await loadData({ quiet: true });
       setShowClosureDialog(false);
       setMessage({ tone: "success", text: "Incident clôturé." });
@@ -1017,7 +1130,7 @@ export function TerrainDirectPage({
         ? buildSmsLink(normalizePhoneNumber(selectedAssignmentOperator.phone), messageBody)
         : buildMailtoLink(
             selectedAssignmentOperator.email.trim(),
-            buildAssignmentEmailSubject(assignmentTarget),
+            buildAssignmentSubject(buildAssignmentTarget(assignmentTarget)),
             messageBody
           );
 
@@ -1056,6 +1169,23 @@ export function TerrainDirectPage({
             {message.text}
           </div>
         ) : null}
+
+        <section className="mb-4 rounded-[24px] border border-slate-200 bg-white px-4 py-3 shadow-[0_10px_24px_rgba(15,23,42,0.06)]">
+          <label className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">
+            Utilisateur pilote
+          </label>
+          <select
+            value={currentUserId}
+            onChange={(event) => setCurrentUserId(event.target.value)}
+            className="mt-2 w-full rounded-[18px] border border-slate-200 bg-slate-50 px-3 py-3 text-sm font-semibold text-slate-900 outline-none"
+          >
+            {FIELDTRACE_USERS.map((user) => (
+              <option key={user.id} value={user.id}>
+                {user.label}
+              </option>
+            ))}
+          </select>
+        </section>
 
         {screen === "home" ? (
           <HomeScreen
@@ -1426,12 +1556,61 @@ export function TerrainDirectPage({
                 <InfoTile label="Clôturé le" value={formatDate(selectedIncident.closed_at)} />
               </div>
 
+              <div className="mt-4 rounded-[22px] border border-slate-200 bg-slate-50 p-4">
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <div className="text-sm font-semibold text-slate-900">Historique terrain</div>
+                    <p className="mt-1 text-xs leading-5 text-slate-500">
+                      Journal des actions enregistrées pour ce dossier.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => void refreshSelectedIncidentEvents(selectedIncident.id)}
+                    className="rounded-full border border-slate-200 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700"
+                  >
+                    Recharger
+                  </button>
+                </div>
+                <div className="mt-3 space-y-3">
+                  {!incidentEventsAvailable ? (
+                    <div className="rounded-[18px] border border-amber-200 bg-amber-50 px-3 py-3 text-xs leading-5 text-amber-800">
+                      {getIncidentEventsUnavailableMessage(incidentEventsUnavailableReason)}
+                    </div>
+                  ) : incidentEvents.length === 0 ? (
+                    <div className="rounded-[18px] border border-slate-200 bg-white px-3 py-3 text-xs leading-5 text-slate-500">
+                      Aucun événement détaillé encore enregistré.
+                    </div>
+                  ) : (
+                    incidentEvents.map((event) => (
+                      <div key={event.id} className="rounded-[18px] border border-slate-200 bg-white px-3 py-3">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <span className="text-xs font-semibold uppercase tracking-[0.14em] text-slate-500">
+                            {labelIncidentEventAction(event.action)}
+                          </span>
+                          <span className="text-xs text-slate-500">
+                            {formatIncidentEventDate(event.created_at)}
+                          </span>
+                        </div>
+                        <p className="mt-2 text-sm leading-5 text-slate-800">{event.summary}</p>
+                        <p className="mt-1 text-xs text-slate-500">
+                          {labelIncidentEventSource(event.source)} · {event.actor_label || "Utilisateur non renseigné"}
+                          {event.actor_role ? ` (${event.actor_role})` : ""}
+                        </p>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+
               {selectedIncident.initial_photo_url ? (
                 <div className="mt-4">
                   <div className="mb-2 text-sm font-semibold text-slate-700">Photo initiale</div>
-                  <img
+                  <Image
                     src={selectedIncident.initial_photo_url}
                     alt="Photo initiale"
+                    width={1200}
+                    height={900}
                     className="w-full rounded-[24px] border border-slate-200 object-cover"
                   />
                 </div>
@@ -1444,9 +1623,11 @@ export function TerrainDirectPage({
                       ? "Photo de clôture"
                       : "Photo de suivi"}
                   </div>
-                  <img
+                  <Image
                     src={selectedIncident.close_photo_url}
                     alt="Photo de suivi"
+                    width={1200}
+                    height={900}
                     className="w-full rounded-[24px] border border-slate-200 object-cover"
                   />
                 </div>
@@ -1712,8 +1893,21 @@ function HomeScreen({
   return (
     <section className="flex flex-1 flex-col justify-center">
       <div className="rounded-[32px] bg-white p-6 shadow-[0_16px_40px_rgba(15,23,42,0.08)]">
-        <h1 className="text-4xl font-black tracking-tight text-slate-950">Field Trace</h1>
-        <p className="mt-3 text-lg font-medium text-slate-700">Suivi des problèmes opérationnels</p>
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <h1 className="text-4xl font-black tracking-tight text-slate-950">Field Trace</h1>
+            <p className="mt-3 text-lg font-medium text-slate-700">Suivi des problèmes opérationnels</p>
+          </div>
+          <div className="flex shrink-0 items-center rounded-2xl border border-slate-100 bg-white px-3 py-2 shadow-sm">
+            <Image
+              src="/brands/veolia-soredi.png"
+              alt="Veolia"
+              width={138}
+              height={44}
+              className="h-7 w-auto"
+            />
+          </div>
+        </div>
 
         <div className="mt-6 rounded-[24px] border border-slate-200 bg-slate-50 p-4 text-sm leading-6 text-slate-700">
           <p>
@@ -1763,7 +1957,18 @@ function TerrainStatusScreen({
   return (
     <main className="flex min-h-screen items-center justify-center bg-[linear-gradient(180deg,#eef4f8_0%,#f8fafc_100%)] px-4">
       <section className="w-full max-w-md rounded-[28px] bg-white p-6 shadow-[0_16px_40px_rgba(15,23,42,0.08)]">
-        <h1 className="text-3xl font-black tracking-tight text-slate-950">Field Trace</h1>
+        <div className="flex items-start justify-between gap-4">
+          <h1 className="text-3xl font-black tracking-tight text-slate-950">Field Trace</h1>
+          <div className="flex shrink-0 items-center rounded-xl border border-slate-100 bg-white px-2 py-1 shadow-sm">
+            <Image
+              src="/brands/veolia-soredi.png"
+              alt="Veolia"
+              width={110}
+              height={35}
+              className="h-5 w-auto"
+            />
+          </div>
+        </div>
         <h2 className="mt-4 text-xl font-bold text-slate-900">{title}</h2>
         <p className="mt-3 text-sm leading-6 text-slate-600">{body}</p>
         {status !== "loading" ? (

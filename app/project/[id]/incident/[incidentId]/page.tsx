@@ -1,13 +1,31 @@
 ﻿"use client";
 
-import React, { useEffect, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import Image from "next/image";
 import Link from "next/link";
+import { withTimeout } from "@/lib/async-timeout";
+import { copyTextToClipboard } from "@/lib/clipboard";
 import {
   getSupabaseBrowserClient,
   getUserFacingSupabaseErrorMessage,
   normalizeSupabaseError,
 } from "@/lib/supabase";
+import {
+  fetchIncidentEvents,
+  formatIncidentEventDate,
+  getIncidentEventsUnavailableMessage,
+  logIncidentEvent,
+  type IncidentEvent,
+  type IncidentEventsUnavailableReason,
+} from "@/lib/incident-events";
+import {
+  DEFAULT_FIELDTRACE_USER_ID,
+  FIELDTRACE_USER_STORAGE_KEY,
+  FIELDTRACE_USERS,
+  getFieldTraceUser,
+} from "@/lib/fieldtrace-users";
+import { formatIncidentReference } from "@/lib/incident-reference";
+import { labelIncidentEventAction, labelIncidentEventSource } from "@/lib/incident-event-labels";
 
 type Project = {
   id: string;
@@ -67,7 +85,7 @@ function formatDate(value?: string | null) {
 }
 
 function incidentRef(id: string) {
-  return `INC-${id.slice(0, 8).toUpperCase()}`;
+  return formatIncidentReference(id);
 }
 
 function labelStatus(status?: string | null) {
@@ -193,8 +211,40 @@ export default function IncidentPage({
   const [isSavingDetails, setIsSavingDetails] = useState(false);
   const [isSavingWorkflow, setIsSavingWorkflow] = useState(false);
   const [isUploadingProof, setIsUploadingProof] = useState(false);
+  const [currentUserId, setCurrentUserId] = useState(DEFAULT_FIELDTRACE_USER_ID);
+  const [incidentEvents, setIncidentEvents] = useState<IncidentEvent[]>([]);
+  const [incidentEventsAvailable, setIncidentEventsAvailable] = useState(true);
+  const [incidentEventsUnavailableReason, setIncidentEventsUnavailableReason] =
+    useState<IncidentEventsUnavailableReason>(null);
 
-  const load = async ({ preserveReadyState = false }: { preserveReadyState?: boolean } = {}) => {
+  const currentUser = useMemo(() => getFieldTraceUser(currentUserId), [currentUserId]);
+
+  const refreshIncidentEvents = useCallback(async () => {
+    if (!incidentId) return;
+    const result = await fetchIncidentEvents(incidentId, 30);
+    setIncidentEvents(result.events);
+    setIncidentEventsAvailable(result.available);
+    setIncidentEventsUnavailableReason(result.reason);
+  }, [incidentId]);
+
+  const recordIncidentEvent = useCallback(async (
+    input: Omit<Parameters<typeof logIncidentEvent>[0], "actor_label" | "actor_role" | "source">
+  ) => {
+    const result = await logIncidentEvent({
+      ...input,
+      actor_label: currentUser.label,
+      actor_role: currentUser.role,
+      source: "project",
+    });
+
+    if (!result.skipped) {
+      await refreshIncidentEvents();
+    }
+
+    return result;
+  }, [currentUser.label, currentUser.role, refreshIncidentEvents]);
+
+  const load = useCallback(async ({ preserveReadyState = false }: { preserveReadyState?: boolean } = {}) => {
     if (!preserveReadyState) {
       setPageStatus("loading");
     }
@@ -203,10 +253,14 @@ export default function IncidentPage({
     try {
       const supabase = getSupabaseBrowserClient();
       const [{ data: projectData, error: projectError }, { data: incidentData, error: incidentError }] =
-        await Promise.all([
-          supabase.from("projects").select("*").eq("id", id).maybeSingle(),
-          supabase.from("incidents").select("*").eq("id", incidentId).eq("project_id", id).maybeSingle(),
-        ]);
+        await withTimeout(
+          Promise.all([
+            supabase.from("projects").select("*").eq("id", id).maybeSingle(),
+            supabase.from("incidents").select("*").eq("id", incidentId).eq("project_id", id).maybeSingle(),
+          ]),
+          15000,
+          "Timeout chargement Supabase dossier incident."
+        );
 
       if (projectError) throw projectError;
       if (incidentError) throw incidentError;
@@ -221,6 +275,7 @@ export default function IncidentPage({
       setProject(projectData);
       setIncident(incidentData as Incident);
       setPageStatus("ready");
+      void refreshIncidentEvents();
     } catch (error) {
       const normalizedError = normalizeSupabaseError(error);
       console.error("[FieldTrace][Incident] Page load failed", {
@@ -233,13 +288,26 @@ export default function IncidentPage({
       setPageStatus(normalizedError.kind === "config" ? "config-error" : "backend-unavailable");
       setErrorMsg(getUserFacingSupabaseErrorMessage(normalizedError.kind));
     }
-  };
+  }, [id, incidentId, refreshIncidentEvents]);
 
   useEffect(() => {
     if (id && incidentId) {
       load();
     }
-  }, [id, incidentId]);
+  }, [id, incidentId, load]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const storedUserId = window.localStorage.getItem(FIELDTRACE_USER_STORAGE_KEY);
+    if (storedUserId && FIELDTRACE_USERS.some((user) => user.id === storedUserId)) {
+      setCurrentUserId(storedUserId);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem(FIELDTRACE_USER_STORAGE_KEY, currentUserId);
+  }, [currentUserId]);
 
   useEffect(() => {
     if (!incident) return;
@@ -307,6 +375,19 @@ export default function IncidentPage({
         return;
       }
 
+      await recordIncidentEvent({
+        incident_id: incident.id,
+        project_id: id,
+        action: "incident_updated",
+        summary: "Détails du dossier incident mis à jour.",
+        metadata: {
+          title: title.trim(),
+          category,
+          priority,
+          assignee: assignee.trim() || null,
+        },
+      });
+
       setSuccessMsg("Le dossier incident a été mis à jour.");
       await load({ preserveReadyState: true });
     } catch (error) {
@@ -354,6 +435,25 @@ export default function IncidentPage({
         setErrorMsg(error.message);
         return;
       }
+
+      const previousStatus = normalizeStatus(incident.status);
+      await recordIncidentEvent({
+        incident_id: incident.id,
+        project_id: id,
+        action:
+          previousStatus === "closed" && statusDraft !== "closed"
+            ? "reopened"
+            : statusDraft === "closed"
+              ? "closed"
+              : "status_changed",
+        summary: `Workflow incident enregistré de ${labelStatus(previousStatus)} vers ${labelStatus(statusDraft)}.`,
+        metadata: {
+          previous_status: previousStatus,
+          next_status: statusDraft,
+          close_comment: closeComment.trim() || null,
+          closed_by_name: statusDraft === "closed" ? closedByName.trim() : null,
+        },
+      });
 
       setSuccessMsg(`Workflow incident enregistré en ${labelStatus(statusDraft)}.`);
       await load({ preserveReadyState: true });
@@ -410,6 +510,22 @@ export default function IncidentPage({
         setErrorMsg(error.message);
         return;
       }
+
+      await recordIncidentEvent({
+        incident_id: incident.id,
+        project_id: id,
+        action: "photo_added",
+        summary:
+          proofSlot === "constat"
+            ? "Preuve de constat ajoutée au dossier complet."
+            : statusDraft === "closed"
+              ? "Preuve de clôture ajoutée au dossier complet."
+              : "Preuve d'action corrective ajoutée au dossier complet.",
+        metadata: {
+          proof_slot: proofSlot,
+          url: data.publicUrl,
+        },
+      });
 
       setProofFile(null);
       setSuccessMsg(
@@ -549,7 +665,16 @@ export default function IncidentPage({
                       onClick={() =>
                         void (async () => {
                           const { generateIncidentClientPdf } = await import("@/lib/incident-pdf");
-                          await generateIncidentClientPdf(project, incident);
+                          await generateIncidentClientPdf(project, incident, incidentEvents);
+                          await recordIncidentEvent({
+                            incident_id: incident.id,
+                            project_id: id,
+                            action: "pdf_exported",
+                            summary: "PDF incident généré depuis le dossier complet.",
+                            metadata: {
+                              report: "incident_client",
+                            },
+                          });
                         })()
                       }
                       className="rounded-xl bg-white px-4 py-2 text-sm font-semibold text-slate-900"
@@ -587,6 +712,22 @@ export default function IncidentPage({
               </div>
 
               <div className="grid gap-3 sm:grid-cols-2 xl:w-[420px]">
+                <div className="rounded-2xl border border-white/10 bg-white/5 p-4 sm:col-span-2">
+                  <label className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-300">
+                    Utilisateur pilote
+                  </label>
+                  <select
+                    value={currentUserId}
+                    onChange={(event) => setCurrentUserId(event.target.value)}
+                    className="mt-2 w-full rounded-xl border border-white/10 bg-slate-950/60 px-3 py-2.5 text-sm font-semibold text-white outline-none"
+                  >
+                    {FIELDTRACE_USERS.map((user) => (
+                      <option key={user.id} value={user.id}>
+                        {user.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
                 <ActionLink
                   href="#details"
                   title="Modifier"
@@ -607,7 +748,12 @@ export default function IncidentPage({
                   body="Préparer un message d'envoi directement exploitable."
                   onClick={async () => {
                     const { buildIncidentClientMailText } = await import("@/lib/incident-pdf");
-                    await navigator.clipboard.writeText(buildIncidentClientMailText(project, incident));
+                    const copyResult = await copyTextToClipboard(buildIncidentClientMailText(project, incident));
+                    if (!copyResult.ok) {
+                      setErrorMsg(copyResult.message);
+                      return;
+                    }
+                    setErrorMsg("");
                     setSuccessMsg("Le résumé client a été copié dans le presse-papiers.");
                   }}
                 />
@@ -934,9 +1080,11 @@ export default function IncidentPage({
                       className="overflow-hidden rounded-[24px] border border-slate-200 bg-slate-50 text-left transition hover:bg-white"
                     >
                       <div className="bg-slate-100 p-3">
-                        <img
+                        <Image
                           src={proof.url}
                           alt={proof.label}
+                          width={900}
+                          height={540}
                           className="h-56 w-full object-contain"
                         />
                       </div>
@@ -980,6 +1128,54 @@ export default function IncidentPage({
                     <p className="mt-2 text-sm leading-6 text-slate-700">{entry.body}</p>
                   </div>
                 ))}
+              </div>
+
+              <div className="mt-6 rounded-2xl border border-slate-200 bg-slate-50 p-4">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div>
+                    <p className="text-sm font-semibold text-slate-900">Journal détaillé</p>
+                    <p className="mt-1 text-sm leading-6 text-slate-600">
+                      Événements enregistrés dans Supabase pour ce dossier.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => void refreshIncidentEvents()}
+                    className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-700"
+                  >
+                    Recharger
+                  </button>
+                </div>
+
+                <div className="mt-4 space-y-3">
+                  {!incidentEventsAvailable ? (
+                    <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm leading-6 text-amber-800">
+                      {getIncidentEventsUnavailableMessage(incidentEventsUnavailableReason)}
+                    </div>
+                  ) : incidentEvents.length === 0 ? (
+                    <div className="rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm leading-6 text-slate-500">
+                      Aucun événement détaillé encore enregistré.
+                    </div>
+                  ) : (
+                    incidentEvents.map((event) => (
+                      <div key={event.id} className="rounded-xl border border-slate-200 bg-white px-4 py-3">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">
+                            {labelIncidentEventAction(event.action)}
+                          </p>
+                          <p className="text-xs text-slate-500">
+                            {formatIncidentEventDate(event.created_at)}
+                          </p>
+                        </div>
+                        <p className="mt-2 text-sm leading-6 text-slate-800">{event.summary}</p>
+                        <p className="mt-1 text-xs text-slate-500">
+                          {labelIncidentEventSource(event.source)} · {event.actor_label || "Utilisateur non renseigné"}
+                          {event.actor_role ? ` (${event.actor_role})` : ""}
+                        </p>
+                      </div>
+                    ))
+                  )}
+                </div>
               </div>
             </section>
 
@@ -1040,7 +1236,16 @@ export default function IncidentPage({
                   onClick={() =>
                     void (async () => {
                       const { generateIncidentClientPdf } = await import("@/lib/incident-pdf");
-                      await generateIncidentClientPdf(project, incident);
+                      await generateIncidentClientPdf(project, incident, incidentEvents);
+                      await recordIncidentEvent({
+                        incident_id: incident.id,
+                        project_id: id,
+                        action: "pdf_exported",
+                        summary: "PDF client généré depuis la restitution professionnelle.",
+                        metadata: {
+                          report: "incident_client",
+                        },
+                      });
                     })()
                   }
                   className="rounded-2xl bg-slate-900 px-5 py-3 text-sm font-semibold text-white"
@@ -1050,7 +1255,12 @@ export default function IncidentPage({
                 <button
                   onClick={async () => {
                     const { buildIncidentClientMailText } = await import("@/lib/incident-pdf");
-                    await navigator.clipboard.writeText(buildIncidentClientMailText(project, incident));
+                    const copyResult = await copyTextToClipboard(buildIncidentClientMailText(project, incident));
+                    if (!copyResult.ok) {
+                      setErrorMsg(copyResult.message);
+                      return;
+                    }
+                    setErrorMsg("");
                     setSuccessMsg("Le texte client a été copié dans le presse-papiers.");
                   }}
                   className="rounded-2xl bg-slate-100 px-5 py-3 text-sm font-semibold text-slate-700"
@@ -1085,9 +1295,11 @@ export default function IncidentPage({
                 Fermer
               </button>
             </div>
-            <img
+            <Image
               src={selectedProof.url}
               alt={selectedProof.label}
+              width={1200}
+              height={800}
               className="max-h-[80vh] w-full object-contain bg-slate-100"
             />
           </div>

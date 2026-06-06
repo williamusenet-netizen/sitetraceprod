@@ -1,4 +1,5 @@
 import jsPDF from "jspdf";
+import { labelIncidentEventAction, labelIncidentEventSource } from "@/lib/incident-event-labels";
 
 type ProjectLike = {
   id: string;
@@ -26,6 +27,17 @@ type IncidentLike = {
   updated_at?: string | null;
   closed_at?: string | null;
 };
+
+type PdfIncidentEvent = {
+  action?: string | null;
+  actor_label?: string | null;
+  actor_role?: string | null;
+  source?: string | null;
+  summary?: string | null;
+  created_at?: string | null;
+};
+
+const VEOLIA_LOGO_PATH = "/brands/veolia-soredi.png";
 
 function projectName(project: ProjectLike) {
   return project.site_name || project.name || "Projet";
@@ -63,44 +75,6 @@ function addWrappedText(doc: jsPDF, text: string, x: number, y: number, width: n
   const lines = doc.splitTextToSize(text || "", width);
   doc.text(lines, x, y);
   return y + lines.length * 5.5;
-}
-
-function ensurePageSpace(doc: jsPDF, y: number, needed: number) {
-  if (y + needed > 282) {
-    doc.addPage();
-    return 20;
-  }
-  return y;
-}
-
-function addSectionTitle(doc: jsPDF, title: string, y: number) {
-  doc.setFont("helvetica", "bold");
-  doc.setFontSize(13);
-  doc.text(title, 14, y);
-  return y + 7;
-}
-
-function addInfoGrid(
-  doc: jsPDF,
-  entries: Array<{ label: string; value: string }>,
-  startY: number
-) {
-  const y = startY;
-  entries.forEach((entry, index) => {
-    const column = index % 2;
-    const row = Math.floor(index / 2);
-    const x = column === 0 ? 14 : 108;
-    const cellY = y + row * 18;
-    doc.setDrawColor(220, 226, 235);
-    doc.roundedRect(x, cellY, 88, 14, 3, 3);
-    doc.setFont("helvetica", "bold");
-    doc.setFontSize(8);
-    doc.text(entry.label, x + 3, cellY + 5);
-    doc.setFont("helvetica", "normal");
-    doc.setFontSize(9);
-    doc.text(doc.splitTextToSize(entry.value || "Non renseigné", 80), x + 3, cellY + 10);
-  });
-  return y + Math.ceil(entries.length / 2) * 18;
 }
 
 async function imageUrlToPngDataUrl(url: string): Promise<string | null> {
@@ -146,6 +120,17 @@ async function imageUrlToPngDataUrl(url: string): Promise<string | null> {
   }
 }
 
+async function addVeoliaBrandLogo(doc: jsPDF) {
+  const logoDataUrl = await imageUrlToPngDataUrl(VEOLIA_LOGO_PATH);
+  if (!logoDataUrl) return;
+
+  try {
+    doc.addImage(logoDataUrl, "PNG", 154, 8, 42, 12);
+  } catch {
+    // Keep the report readable if the client logo cannot be embedded.
+  }
+}
+
 function fitRect(
   width: number,
   height: number,
@@ -168,7 +153,11 @@ async function getImageDimensions(dataUrl: string): Promise<{ width: number; hei
   });
 }
 
-export async function generateProjectReportPdf(project: ProjectLike, incidents: IncidentLike[]) {
+export async function generateProjectReportPdf(
+  project: ProjectLike,
+  incidents: IncidentLike[],
+  eventsByIncident: Record<string, PdfIncidentEvent[]> = {}
+) {
   const doc = new jsPDF();
   const name = projectName(project);
 
@@ -177,6 +166,7 @@ export async function generateProjectReportPdf(project: ProjectLike, incidents: 
     "Rapport projet",
     "Pilotage terrain, incidents, priorités et suivi projet"
   );
+  await addVeoliaBrandLogo(doc);
 
   doc.setFont("helvetica", "normal");
   doc.setFontSize(11);
@@ -189,6 +179,11 @@ export async function generateProjectReportPdf(project: ProjectLike, incidents: 
   const openCount = incidents.filter((i) => (i.status || "open") !== "closed").length;
   const closedCount = incidents.filter((i) => (i.status || "open") === "closed").length;
   const criticalCount = incidents.filter((i) => (i.priority || "").toLowerCase() === "critical").length;
+  const projectEvents = Object.values(eventsByIncident).flat();
+  const terrainEventCount = projectEvents.filter((event) => event.source === "terrain").length;
+  const bossEventCount = projectEvents.filter((event) => event.source === "boss").length;
+  const closureEventCount = projectEvents.filter((event) => event.action === "closed").length;
+  const exportEventCount = projectEvents.filter((event) => event.action === "pdf_exported").length;
 
   doc.setFont("helvetica", "bold");
   doc.text("Synthèse", 14, 98);
@@ -197,6 +192,16 @@ export async function generateProjectReportPdf(project: ProjectLike, incidents: 
   doc.text(`Incidents ouverts : ${openCount}`, 14, 114);
   doc.text(`Incidents clôturés : ${closedCount}`, 14, 122);
   doc.text(`Incidents critiques : ${criticalCount}`, 14, 130);
+
+  if (projectEvents.length > 0) {
+    doc.setFont("helvetica", "bold");
+    doc.text("Synthese journal", 108, 98);
+    doc.setFont("helvetica", "normal");
+    doc.text(`Evenements traces : ${projectEvents.length}`, 108, 106);
+    doc.text(`Actions terrain : ${terrainEventCount}`, 108, 114);
+    doc.text(`Actions bureau : ${bossEventCount}`, 108, 122);
+    doc.text(`Clotures / exports : ${closureEventCount} / ${exportEventCount}`, 108, 130);
+  }
 
   let y = 144;
 
@@ -211,17 +216,37 @@ export async function generateProjectReportPdf(project: ProjectLike, incidents: 
     for (let index = 0; index < incidents.length; index++) {
       const incident = incidents[index];
 
-      let photoDataUrl: string | null = null;
-      let photoDim: { width: number; height: number } | null = null;
+      const proofPhotoInputs = [
+        incident.initial_photo_url ? { label: "Photo initiale", url: incident.initial_photo_url } : null,
+        incident.close_photo_url ? { label: "Photo de cloture", url: incident.close_photo_url } : null,
+      ].filter(Boolean) as Array<{ label: string; url: string }>;
+      const proofPhotos: Array<{
+        label: string;
+        dataUrl: string;
+        dim: { width: number; height: number };
+      }> = [];
 
-      if (incident.initial_photo_url) {
-        photoDataUrl = await imageUrlToPngDataUrl(incident.initial_photo_url);
-        if (photoDataUrl) {
-          photoDim = await getImageDimensions(photoDataUrl);
-        }
+      for (const proofPhoto of proofPhotoInputs) {
+        const dataUrl = await imageUrlToPngDataUrl(proofPhoto.url);
+        if (!dataUrl) continue;
+        const dim = await getImageDimensions(dataUrl);
+        if (!dim) continue;
+        proofPhotos.push({ label: proofPhoto.label, dataUrl, dim });
       }
 
-      const blockHeight = photoDataUrl && photoDim ? 54 : 34;
+      const eventLines = (eventsByIncident[incident.id] || []).slice(0, 3).map((event) => {
+        const date = event.created_at ? formatDate(event.created_at) : "Date non renseignée";
+        const source = labelIncidentEventSource(event.source);
+        const actor = event.actor_label || "Utilisateur";
+        const role = event.actor_role ? ` (${event.actor_role})` : "";
+        return `${date} - ${source} - ${actor}${role} - ${
+          event.summary || labelIncidentEventAction(event.action)
+        }`;
+      });
+      const wrappedEventLines = eventLines.flatMap((line) => doc.splitTextToSize(line, 158) as string[]);
+      const eventHeight = wrappedEventLines.length > 0 ? 9 + wrappedEventLines.length * 5 : 0;
+      const photoHeight = proofPhotos.length > 0 ? 32 : 0;
+      const blockHeight = 34 + eventHeight + photoHeight;
 
       if (y + blockHeight > 280) {
         doc.addPage();
@@ -241,13 +266,35 @@ export async function generateProjectReportPdf(project: ProjectLike, incidents: 
       doc.text(`Déclaré par : ${incident.reporter_name || "Non renseigné"}`, 18, y + 24);
       doc.text(`Créé le : ${formatDate(incident.created_at)}`, 100, y + 24);
 
-      if (photoDataUrl && photoDim) {
-        const fit = fitRect(photoDim.width, photoDim.height, 34, 22);
-        try {
-          doc.addImage(photoDataUrl, "PNG", 18, y + 28, fit.width, fit.height);
-        } catch {
-          // keep report readable even if image injection fails
-        }
+      let contentY = y + 32;
+
+      if (wrappedEventLines.length > 0) {
+        doc.setFont("helvetica", "bold");
+        doc.text("Journal recent", 18, contentY);
+        contentY += 6;
+        doc.setFont("helvetica", "normal");
+        wrappedEventLines.forEach((line) => {
+          doc.text(line, 18, contentY);
+          contentY += 5;
+        });
+      }
+
+      if (proofPhotos.length > 0) {
+        doc.setFont("helvetica", "bold");
+        doc.text("Preuves photo", 18, contentY);
+        contentY += 5;
+
+        proofPhotos.slice(0, 2).forEach((proofPhoto, proofIndex) => {
+          const x = 18 + proofIndex * 42;
+          const fit = fitRect(proofPhoto.dim.width, proofPhoto.dim.height, 34, 20);
+          try {
+            doc.setFont("helvetica", "normal");
+            doc.text(proofPhoto.label, x, contentY);
+            doc.addImage(proofPhoto.dataUrl, "PNG", x, contentY + 3, fit.width, fit.height);
+          } catch {
+            // keep report readable even if image injection fails
+          }
+        });
       }
 
       y += blockHeight + 8;
@@ -266,6 +313,7 @@ export async function generateIncidentClaimPdf(project: ProjectLike, incident: I
     "Claim / Lettre de réserve",
     "Document unitaire prêt à transmission client"
   );
+  await addVeoliaBrandLogo(doc);
 
   let y = 52;
 
