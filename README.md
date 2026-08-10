@@ -76,3 +76,9 @@ Ne jamais stocker le mot de passe reel dans le depot.
 - la version actuelle est preparee pour une demonstration propre orientee metier
 - les incidents existants du pilote Soredi sont des donnees reelles et ne doivent pas etre modifies pour tester
 - les outils QA internes et datasets de seed ne font pas partie du perimetre public de demonstration
+
+## Propriété intellectuelle / Intellectual property
+
+Ce dépôt contient des éléments propriétaires. Voir [NOTICE.md](NOTICE.md). Les composants tiers restent soumis à leurs licences respectives.
+
+This repository contains proprietary elements. See [NOTICE.md](NOTICE.md). Third-party components remain governed by their respective licences.
